@@ -1,4 +1,5 @@
 # Macon Geothermal Heat Pump Control
+Use CN17, Pin A1 and B1 to connect your RS485 adapter. See Photo...
 
 Scripts for controlling Macon geothermal heat pumps via Modbus RTU (Protocol V1.3).
 
