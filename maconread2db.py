@@ -2,17 +2,26 @@
 # maconread2db.py — Macon Geothermal Heat Pump Modbus reader + MariaDB pivot
 # Logs all data to macon_pivot table, including Volumeflow from wagodb.mbus2
 # Calls write_freq.py for write operations
-# Version: 1.2.0
+# Version: 1.2.3
+
+# Configuration flag to disable database operations
+DISABLE_DB = False  # Set to True to disable all database operations and pymysql import
 
 import os
 from pymodbus.client import ModbusSerialClient
 from pymodbus.exceptions import ModbusException
-import pymysql
 from datetime import datetime
 
+# Conditionally import pymysql based on DISABLE_DB
+if not DISABLE_DB:
+    try:
+        import pymysql
+    except ImportError:
+        print("⚠️ pymysql missing. DB disabled.")
+        DISABLE_DB = True
+
 # Call write_freq.py
-timestamp = datetime.now()
-result = os.system('python3 /home/pi/python/write_freq.py')
+os.system('python3 /home/pi/python/write_freq.py')
 # ------------------------------------------------------
 # Modbus RTU Configuration
 # ------------------------------------------------------
@@ -27,18 +36,18 @@ client = ModbusSerialClient(
 SLAVE_ADDRESS = 1
 
 # ------------------------------------------------------
-# MariaDB Configuration
+# MariaDB Configuration (only used if DB is enabled)
 # ------------------------------------------------------
-DB_CONFIG = {
-    "host": "192.168.178.23",
-    "user": "youruser",
-    "password": "yourpw",
-    "database": "wagodb",
-    "charset": "utf8mb4",
-    "cursorclass": pymysql.cursors.DictCursor
-}
-
-PIVOT_TABLE = "macon_pivot"
+if not DISABLE_DB:
+    DB_CONFIG = {
+        "host": "192.168.178.23",
+        "user": "gh",
+        "password": "a12345",
+        "database": "wagodb",
+        "charset": "utf8mb4",
+        "cursorclass": pymysql.cursors.DictCursor
+    }
+    PIVOT_TABLE = "macon_pivot"
 
 # ------------------------------------------------------
 # Register Map
@@ -131,8 +140,7 @@ def read_register(address):
         if not res.isError():
             return res.registers[0]
     except ModbusException:
-        pass
-    return None
+        return None
 
 def read_block(start, count):
     """Read multiple registers"""
@@ -141,86 +149,75 @@ def read_block(start, count):
         if not res.isError():
             return res.registers
     except ModbusException:
-        pass
-    return None
-
-def fetch_volumeflow(cursor, timestamp):
-    """Fetch the most recent Volumeflow from wagodb.mbus2 within ±150 seconds"""
-    try:
-        cursor.execute("""
-            SELECT Volumeflow
-            FROM wagodb.mbus2
-            WHERE dt <= %s
-            AND dt >= %s - INTERVAL 150 SECOND
-            ORDER BY dt DESC
-            LIMIT 1
-        """, (timestamp, timestamp))
-        result = cursor.fetchone()
-        return result['Volumeflow'] if result else None
-    except Exception as e:
-        print(f"⚠️ Error fetching Volumeflow: {e}")
         return None
 
-def ensure_pivot_table(cursor):
-    """Ensure macon_pivot table exists"""
-    cursor.execute(f"""
-        CREATE TABLE IF NOT EXISTS {PIVOT_TABLE} (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            timestamp DATETIME NOT NULL
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """)
+if not DISABLE_DB:
+    def fetch_volumeflow(cursor):
+        """Fetch the Volumeflow with the highest id from wagodb.mbus2"""
+        try:
+            cursor.execute("""
+                SELECT Volumeflow
+                FROM wagodb.mbus2
+                WHERE id = (SELECT MAX(id) FROM wagodb.mbus2)
+            """)
+            result = cursor.fetchone()
+            return result['Volumeflow'] if result else None
+        except Exception:
+            return None  # Suppress error logging
 
-def ensure_pivot_columns(cursor):
-    """Ensure pivot columns exist for all registers, bit flags, and Volumeflow"""
-    cursor.execute(f"SHOW COLUMNS FROM {PIVOT_TABLE}")
-    existing = [row["Field"] for row in cursor.fetchall()]
+    def ensure_pivot_table(cursor):
+        """Ensure macon_pivot table exists"""
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {PIVOT_TABLE} (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                timestamp DATETIME NOT NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
 
-    # Normal registers
-    for _, (name, _) in REGISTER_MAP.items():
-        if name not in existing:
-            cursor.execute(f"ALTER TABLE {PIVOT_TABLE} ADD COLUMN `{name}` FLOAT NULL;")
+    def ensure_pivot_columns(cursor):
+        """Ensure pivot columns exist for all registers, bit flags, and Volumeflow"""
+        cursor.execute(f"SHOW COLUMNS FROM {PIVOT_TABLE}")
+        existing = [row["Field"] for row in cursor.fetchall()]
 
-    # Bit flags
-    for reg, bits in BIT_MAP.items():
-        for bit, label in bits.items():
-            col = f"Bit{bit}_{label}"
-            if col not in existing:
-                cursor.execute(f"ALTER TABLE {PIVOT_TABLE} ADD COLUMN `{col}` TINYINT(1) DEFAULT 0;")
+        for _, (name, _) in REGISTER_MAP.items():
+            if name not in existing:
+                cursor.execute(f"ALTER TABLE {PIVOT_TABLE} ADD COLUMN `{name}` FLOAT NULL;")
 
-    # Volumeflow column
-    if "Volumeflow" not in existing:
-        cursor.execute(f"ALTER TABLE {PIVOT_TABLE} ADD COLUMN `Volumeflow` FLOAT NULL;")
+        for reg, bits in BIT_MAP.items():
+            for bit, label in bits.items():
+                col = f"Bit{bit}_{label}"
+                if col not in existing:
+                    cursor.execute(f"ALTER TABLE {PIVOT_TABLE} ADD COLUMN `{col}` TINYINT(1) DEFAULT 0;")
 
-def insert_pivot_row(cursor, timestamp, results, bit_expanded, volumeflow):
-    """Insert one row into pivot table with expanded bits and Volumeflow"""
-    cols = ["timestamp"]
-    vals = [timestamp]
+        if "Volumeflow" not in existing:
+            cursor.execute(f"ALTER TABLE {PIVOT_TABLE} ADD COLUMN `Volumeflow` FLOAT NULL;")
 
-    # Main registers
-    for r, (n, v, u) in results.items():
-        cols.append(n)
-        vals.append(v)
+    def insert_pivot_row(cursor, timestamp, results, bit_expanded, volumeflow):
+        """Insert one row into pivot table with expanded bits and Volumeflow"""
+        cols = ["timestamp"]
+        vals = [timestamp]
 
-    # Bit flags
-    for col, bit_val in bit_expanded.items():
-        cols.append(col)
-        vals.append(bit_val)
+        for r, (n, v, u) in results.items():
+            cols.append(n)
+            vals.append(v)
 
-    # Volumeflow
-    cols.append("Volumeflow")
-    vals.append(volumeflow)
+        for col, bit_val in bit_expanded.items():
+            cols.append(col)
+            vals.append(bit_val)
 
-    placeholders = ", ".join(["%s"] * len(vals))
-    columns = ", ".join([f"`{c}`" for c in cols])
-    sql = f"INSERT INTO {PIVOT_TABLE} ({columns}) VALUES ({placeholders})"
-    cursor.execute(sql, vals)
+        cols.append("Volumeflow")
+        vals.append(volumeflow)
+
+        placeholders = ", ".join(["%s"] * len(vals))
+        columns = ", ".join([f"`{c}`" for c in cols])
+        cursor.execute(f"INSERT INTO {PIVOT_TABLE} ({columns}) VALUES ({placeholders})", vals)
 
 # ------------------------------------------------------
 # Main
 # ------------------------------------------------------
 def main():
     if not client.connect():
-        print("❌ Failed to connect Modbus")
+        print("❌ Modbus failed")
         return
 
     timestamp = datetime.now()
@@ -228,14 +225,14 @@ def main():
     bit_expanded = {}
 
     try:
-        # --- Read RW registers ---
+        # Read RW registers
         for reg in [2004, 2007, 2047, 2052, 2056, 2057]:
             val = read_register(reg)
             if val is not None and reg in REGISTER_MAP:
                 desc, unit = REGISTER_MAP[reg]
                 results[reg] = (desc, val, unit)
 
-        # --- Read RO registers ---
+        # Read RO registers
         ro_data = read_block(2100, 39)
         if ro_data:
             for i, val in enumerate(ro_data):
@@ -243,30 +240,25 @@ def main():
                 if reg in REGISTER_MAP:
                     desc, unit = REGISTER_MAP[reg]
                     results[reg] = (desc, val, unit)
-
-                    # If this register has bit definitions, expand them
                     if unit == "bits" and reg in BIT_MAP:
                         bits = decode_bits(val)
                         for bit, label in BIT_MAP[reg].items():
                             bit_expanded[f"Bit{bit}_{label}"] = bits.get(bit, 0)
 
-        # --- Fetch Volumeflow from mbus2 ---
-        conn = pymysql.connect(**DB_CONFIG)
-        with conn.cursor() as cursor:
-            volumeflow = fetch_volumeflow(cursor, timestamp)
+        if not DISABLE_DB:
+            conn = pymysql.connect(**DB_CONFIG)
+            with conn.cursor() as cursor:
+                volumeflow = fetch_volumeflow(cursor)
+                ensure_pivot_table(cursor)
+                ensure_pivot_columns(cursor)
+                insert_pivot_row(cursor, timestamp, results, bit_expanded, volumeflow)
+            conn.commit()
+            conn.close()
 
-            # --- Write to DB (macon_pivot only) ---
-            ensure_pivot_table(cursor)
-            ensure_pivot_columns(cursor)
-            insert_pivot_row(cursor, timestamp, results, bit_expanded, volumeflow)
+        print(f"✅ {timestamp:%H:%M:%S}")
 
-        conn.commit()
-        conn.close()
-
-        print(f"✅ Logged {len(results)} registers + {len(bit_expanded)} bits + Volumeflow at {timestamp}")
-
-    except Exception as e:
-        print(f"⚠️ Error: {e}")
+    except Exception:
+        print("⚠️ Error")
     finally:
         client.close()
 
