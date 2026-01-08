@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-# heizung2.py v4.3.1 - MIT INVERTIERTEN RELAIS & WASSERTANK & RU=DRUCKSENSOR
+# heizung2.py v4.3.2 - MIT INVERTIERTEN RELAIS & WASSERTANK & RU=DRUCKSENSOR
 import pymysql, sys, pandas as pd
 from datetime import datetime
 from pymodbus.client import ModbusTcpClient
@@ -116,7 +116,7 @@ def ensure_schema(eng):
                     temp_warmwasser DECIMAL(5,2),
                     wert_oeltank DECIMAL(7,2),
                     raw_ruecklauf SMALLINT UNSIGNED,
-                    temp_ruecklauf DECIMAL(5,2),
+                    temp_ruecklauf DECIMAL(5,2) DEFAULT NULL COMMENT 'Drucksensor (nicht PT1000)',
                     raw_solar SMALLINT UNSIGNED,
                     temp_solar DECIMAL(5,2),
                     ky9a DECIMAL(5,2),
@@ -143,6 +143,13 @@ def ensure_schema(eng):
                 if not col_ex:
                     c.execute(text("ALTER TABLE heizung ADD COLUMN temp_wassertank DECIMAL(5,2) DEFAULT NULL COMMENT 'R290 Wassertank-Temperatur'"))
                     c.execute(text("INSERT INTO schema_version(version,description) VALUES(9,'Added R290 tank temperature column')"))
+
+        # Schema-Version 10: temp_ruecklauf NULL-fähig machen (RU ist Drucksensor, nicht PT1000)
+        if cv < 10:
+            tbl_ex = c.execute(text("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='wagodb' AND table_name='heizung'")).scalar()
+            if tbl_ex:
+                c.execute(text("ALTER TABLE heizung MODIFY COLUMN temp_ruecklauf DECIMAL(5,2) DEFAULT NULL COMMENT 'Drucksensor (nicht PT1000)'"))
+                c.execute(text("INSERT INTO schema_version(version,description) VALUES(10,'temp_ruecklauf nullable for pressure sensor')"))
 
 now = datetime.now(); mqtt_t = get_mqtt(); eng = create_engine(DB_URL, pool_pre_ping=True)
 ensure_schema(eng); cl = ModbusTcpClient(SPS_IP, 502, timeout=5)
