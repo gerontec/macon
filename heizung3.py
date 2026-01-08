@@ -2,8 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-HEIZUNGSSTEUERUNG v4.4.1 - MIT BITMASKEN-DEKODIERUNG & NACHTABSENKUNG
+HEIZUNGSSTEUERUNG v4.4.2 - MIT BITMASKEN-DEKODIERUNG & NACHTABSENKUNG
 ================================================================================
+ÄNDERUNGEN v4.4.2:
+- RU ist Drucksensor (nicht PT1000) - zeigt nun raw-Wert statt 0.00°C
+- temp_ruecklauf = None in Datenbank (keine falsche Temperatur mehr)
+
 ÄNDERUNGEN v4.4.1:
 - MQTT Host korrigiert auf 192.168.178.218
 - Tank-Temperatur immer angezeigt (auch wenn '---')
@@ -39,7 +43,7 @@ from pymodbus.client import ModbusTcpClient
 import paho.mqtt.client as mqtt
 import time
 
-VERSION = '4.4.1'
+VERSION = '4.4.2'
 
 # =============================================================================
 # KONFIGURATION
@@ -493,7 +497,8 @@ def run_sync(args):
         temp_it = calc_pt1000(raw_it)
         temp_ke = calc_pt1000(raw_ke)
         temp_ww = calc_boiler(raw_ww)
-        temp_ru = calc_pt1000(raw_ru)
+        # RU ist ein Drucksensor (nicht PT1000), daher nur Raw-Wert verwenden
+        temp_ru = None  # Drucksensor-Kalibrierung nicht bekannt
         temp_so = calc_solar(raw_so)
         temp_ot = float(raw_ot)
         
@@ -610,7 +615,7 @@ def run_sync(args):
         
         print("TEMPERATUREN:")
         print(f"  VL: {temp_vl:6.2f}°C | AT: {temp_at:6.2f}°C | IT: {temp_it:6.2f}°C")
-        print(f"  KE: {temp_ke:6.2f}°C | WW: {temp_ww:6.2f}°C | RU: {temp_ru:6.2f}°C")
+        print(f"  KE: {temp_ke:6.2f}°C | WW: {temp_ww:6.2f}°C | RU: raw={raw_ru}")
         print(f"  SO: {temp_so:6.2f}°C | OT: {temp_ot:.2f}")
         print(f"  ΔT(Kessel-WW): {temp_diff_ww:.2f}°C")
         print(f"  R290-Tank: {tank_display}")

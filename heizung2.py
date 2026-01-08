@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-# heizung2.py v4.3.0 - MIT INVERTIERTEN RELAIS & WASSERTANK
+# heizung2.py v4.3.1 - MIT INVERTIERTEN RELAIS & WASSERTANK & RU=DRUCKSENSOR
 import pymysql, sys, pandas as pd
 from datetime import datetime
 from pymodbus.client import ModbusTcpClient
@@ -165,6 +165,9 @@ try:
     sw,hr = to_s(reg[10]),to_s(reg[9])
     di8 = to_u(reg[8])
 
+    # RU ist ein Drucksensor (nicht PT1000), daher nur Raw-Wert speichern
+    temp_ruecklauf = None  # Drucksensor-Kalibrierung nicht bekannt
+
     # Version dekodieren
     ver_word = to_u(reg[15])
     ver_major = (ver_word >> 8) & 0xFF
@@ -211,7 +214,7 @@ try:
             'raw_vorlauf':rv, 'raw_aussen':ra, 'raw_innen':ri, 'raw_kessel':rk,
             'temp_vorlauf':calc_pt(rv), 'temp_aussen':calc_pt(ra), 'temp_innen':calc_pt(ri), 'temp_kessel':calc_pt(rk),
             'raw_warmwasser':rw, 'temp_warmwasser':calc_bo(rw), 'wert_oeltank':float(ro),
-            'raw_ruecklauf':ru, 'temp_ruecklauf':calc_pt(ru), 'raw_solar':rs, 'temp_solar':calc_so(rs),
+            'raw_ruecklauf':ru, 'temp_ruecklauf':temp_ruecklauf, 'raw_solar':rs, 'temp_solar':calc_so(rs),
             'ky9a':mqtt_t, 'status_word':sw, 'di8_raw':di8,
             'reason_ww':rww, 'reason_hk':rhk, 'reason_br':rbr,
             'runtime_ww_h':rtw_h, 'runtime_hk_h':rth_h, 'runtime_br_h':rtb_h,
@@ -225,7 +228,7 @@ try:
     print("="*80)
     print(f"HEIZUNG v4.3 | {now:%Y-%m-%d %H:%M:%S} | SPS v{sps_version} | Phase {ph}")
     print(f"VL:{data['temp_vorlauf']:5.1f}°C AT:{data['temp_aussen']:5.1f}°C IT:{data['temp_innen']:5.1f}°C KE:{data['temp_kessel']:5.1f}°C")
-    print(f"WW:{data['temp_warmwasser']:5.1f}°C RU:{data['temp_ruecklauf']:5.1f}°C SO:{data['temp_solar']:5.1f}°C Tank:{tank_display}")
+    print(f"WW:{data['temp_warmwasser']:5.1f}°C RU:raw={ru} SO:{data['temp_solar']:5.1f}°C Tank:{tank_display}")
     print(f"Node3(KY9A):{mqtt_display}")
     print(f"Pumpen: WW={'AN' if ww_pump else 'AUS'} HK={'AN' if hk_pump else 'AUS'} BR={'AN' if br_pump else 'AUS'}")
     print(f"Runtime: WW={fmt_rt(rtw_sec)}({cyw}×) HK={fmt_rt(rth_sec)}({cyh}×) BR={fmt_rt(rtb_sec)}({cyb}×)")
