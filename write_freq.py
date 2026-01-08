@@ -134,7 +134,6 @@ if not client.connect():
     logger.error("❌ Modbus connection failed")
     exit(1)
 
-timestamp = datetime.now()
 try:
     logger.info("🚀 Starting operations")
     success = True
@@ -208,4 +207,5 @@ except Exception as e:
     success = False
 finally:
     client.close()
-    logger.info(f"🔒 Connection closed at {timestamp:%H:%M:%S}")
+    close_time = datetime.now()
+    logger.info(f"🔒 Connection closed at {close_time:%H:%M:%S}")
