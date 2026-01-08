@@ -36,7 +36,9 @@ from sqlalchemy import create_engine, text
 # ...
 # =============================================================================
 
-SPS_IP, DB_URL = '192.168.178.2', 'mysql+pymysql://gh:a12345@10.8.0.1/wagodb'
+SPS_IP = '192.168.178.2'
+MQTT_HOST = '192.168.178.218'
+DB_URL = 'mysql+pymysql://gh:a12345@10.8.0.1/wagodb'
 mqtt_val, mqtt_rx = None, False
 
 def on_msg(c, u, m):
@@ -45,15 +47,17 @@ def on_msg(c, u, m):
     except: pass
 
 def get_mqtt():
+    """Liest Raumtemperatur von MQTT Node3/pin4 (KY-9A Sensor)"""
     global mqtt_val, mqtt_rx
     mqtt_val, mqtt_rx = None, False
     try:
-        c = mqtt.Client(); c.on_message = on_msg; c.connect('localhost', 1883, 60)
+        c = mqtt.Client(); c.on_message = on_msg; c.connect(MQTT_HOST, 1883, 60)
         c.subscribe('Node3/pin4'); st = time.time(); c.loop_start()
-        while not mqtt_rx and time.time()-st < 5: time.sleep(0.1)
+        while not mqtt_rx and time.time()-st < 3: time.sleep(0.1)  # Timeout auf 3s reduziert
         c.loop_stop(); c.disconnect()
         return mqtt_val if mqtt_rx else None
-    except: return None
+    except Exception as e:
+        return None  # Fehler stillschweigend ignorieren
 
 calc_pt = lambda r: round((r-7134)/25, 2) if 4000<r<25000 else 0.0
 calc_bo = lambda r: round((40536-r)/303.1, 2) if 4000<r<45000 else 0.0
@@ -214,14 +218,15 @@ try:
             'cycles_ww':cyw, 'cycles_hk':cyh, 'cycles_br':cyb,
             'temp_wassertank': temp_tank}
 
-    # Formatiere Tank-Temperatur für Ausgabe
+    # Formatiere Temperaturen für Ausgabe
     tank_display = f"{temp_tank:5.1f}°C" if temp_tank is not None else "  ---  "
+    mqtt_display = f"{mqtt_t:5.1f}°C" if mqtt_t is not None else "  ---  "
 
     print("="*80)
     print(f"HEIZUNG v4.3 | {now:%Y-%m-%d %H:%M:%S} | SPS v{sps_version} | Phase {ph}")
     print(f"VL:{data['temp_vorlauf']:5.1f}°C AT:{data['temp_aussen']:5.1f}°C IT:{data['temp_innen']:5.1f}°C KE:{data['temp_kessel']:5.1f}°C")
     print(f"WW:{data['temp_warmwasser']:5.1f}°C RU:{data['temp_ruecklauf']:5.1f}°C SO:{data['temp_solar']:5.1f}°C Tank:{tank_display}")
-    if mqtt_t: print(f"MQTT:{mqtt_t:5.1f}°C")
+    print(f"Node3(KY9A):{mqtt_display}")
     print(f"Pumpen: WW={'AN' if ww_pump else 'AUS'} HK={'AN' if hk_pump else 'AUS'} BR={'AN' if br_pump else 'AUS'}")
     print(f"Runtime: WW={fmt_rt(rtw_sec)}({cyw}×) HK={fmt_rt(rth_sec)}({cyh}×) BR={fmt_rt(rtb_sec)}({cyb}×)")
     print(f"Reason: WW={dec_rea(rww,'WW')} HK={dec_rea(rhk,'HK')} BR={dec_rea(rbr,'BR')}")
