@@ -2,8 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-HEIZUNGSSTEUERUNG v4.4.2 - MIT BITMASKEN-DEKODIERUNG & NACHTABSENKUNG
+HEIZUNGSSTEUERUNG v4.4.3 - MIT BITMASKEN-DEKODIERUNG & NACHTABSENKUNG
 ================================================================================
+ÄNDERUNGEN v4.4.3:
+- MQTT Timeout erhöht: 3s → 6s für zuverlässigeren Empfang
+
 ÄNDERUNGEN v4.4.2:
 - RU ist Drucksensor (nicht PT1000) - zeigt nun raw-Wert statt 0.00°C
 - temp_ruecklauf = None in Datenbank (keine falsche Temperatur mehr)
@@ -43,7 +46,7 @@ from pymodbus.client import ModbusTcpClient
 import paho.mqtt.client as mqtt
 import time
 
-VERSION = '4.4.2'
+VERSION = '4.4.3'
 
 # =============================================================================
 # KONFIGURATION
@@ -51,7 +54,7 @@ VERSION = '4.4.2'
 SPS_IP = '192.168.178.2'
 MQTT_BROKER = '192.168.178.218'  # ← KORRIGIERT: nicht mehr localhost!
 MQTT_TOPIC = 'Node3/pin4'
-MQTT_TIMEOUT = 3  # ← REDUZIERT: von 5s auf 3s
+MQTT_TIMEOUT = 6  # ← ERHÖHT: 6s für zuverlässigen Empfang
 
 DB_CONFIG = {
     'host': '10.8.0.1',

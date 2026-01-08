@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-# heizung2.py v4.3.2 - MIT INVERTIERTEN RELAIS & WASSERTANK & RU=DRUCKSENSOR
+# heizung2.py v4.3.3 - MIT INVERTIERTEN RELAIS & WASSERTANK & RU=DRUCKSENSOR
 import pymysql, sys, pandas as pd
 from datetime import datetime
 from pymodbus.client import ModbusTcpClient
@@ -53,7 +53,7 @@ def get_mqtt():
     try:
         c = mqtt.Client(); c.on_message = on_msg; c.connect(MQTT_HOST, 1883, 60)
         c.subscribe('Node3/pin4'); st = time.time(); c.loop_start()
-        while not mqtt_rx and time.time()-st < 3: time.sleep(0.1)  # Timeout auf 3s reduziert
+        while not mqtt_rx and time.time()-st < 6: time.sleep(0.1)  # Timeout 6s für zuverlässigen Empfang
         c.loop_stop(); c.disconnect()
         return mqtt_val if mqtt_rx else None
     except Exception as e:
