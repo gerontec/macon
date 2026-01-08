@@ -6,7 +6,7 @@
 # - Checks Register 2136, Bit 3 (Brine pump status)
 # - Checks Register 2137 for errors
 # - Logs to /tmp/macon_control.log, capped at 100kB with round-robin
-# Version: 1.8.8
+# Version: 1.8.9
 
 import time
 import os
@@ -80,7 +80,7 @@ def setup_logging():
     return logger
 
 logger = setup_logging()
-logger.info("Starting write_freq.py v1.8.8")
+logger.info("Starting write_freq.py v1.8.9")
 
 # Helper Functions
 def decode_bits(value, reg):
@@ -134,7 +134,6 @@ if not client.connect():
     logger.error("❌ Modbus connection failed")
     exit(1)
 
-timestamp = datetime.now()
 try:
     logger.info("🚀 Starting operations")
     success = True
@@ -208,4 +207,5 @@ except Exception as e:
     success = False
 finally:
     client.close()
-    logger.info(f"🔒 Connection closed at {timestamp:%H:%M:%S}")
+    close_time = datetime.now()
+    logger.info(f"🔒 Connection closed at {close_time:%H:%M:%S}")
