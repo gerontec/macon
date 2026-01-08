@@ -257,8 +257,8 @@ def main():
 
         print(f"✅ {timestamp:%H:%M:%S}")
 
-    except Exception:
-        print("⚠️ Error")
+    except Exception as e:
+        print(f"⚠️ Error: {e}")
     finally:
         client.close()
 
