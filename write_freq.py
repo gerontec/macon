@@ -1,12 +1,14 @@
 #!/usr/bin/python3
 # write_freq.py — Sets registers and optional soft reset for Macon heat pump (Modbus RTU)
 # - Register 2000: Unit ON/OFF (0=OFF, 1=ON) for soft reset
-# - Register 2007: Hot water tank ΔT (5°C)
-# - Register 2004: DHW setpoint (45°C)
+# - Register 2007: Hot water tank ΔT (4°C)
+# - Register 2004: DHW setpoint (46°C)
+# - Checks Register 2118 (actual frequency) before writing target frequency
+# - Only writes Register 2057 if current_freq < target_freq (smart frequency control)
 # - Checks Register 2136, Bit 3 (Brine pump status)
 # - Checks Register 2137 for errors
 # - Logs to /tmp/macon_control.log, capped at 100kB with round-robin
-# Version: 1.8.8
+# Version: 1.9.0
 
 import time
 import os
@@ -37,6 +39,7 @@ REGISTERS = {
     2007: {"name": "Hot water tank ΔT", "unit": "°C", "desc": "Temperature difference for hot water tank"},
     2056: {"name": "Host frequency control", "unit": "", "desc": "0=NO, 1=YES"},
     2057: {"name": "Compressor frequency setting", "unit": "Hz", "desc": "Host unit compressor frequency (0-120)"},
+    2118: {"name": "Compressor frequency", "unit": "Hz", "desc": "Actual compressor frequency (read-only)"},
     2136: {"name": "System working status", "unit": "", "desc": "Bit-mapped status (Bit 3=Brine pump)"},
     2137: {"name": "Error code", "unit": "", "desc": "Error codes (e.g., Bit 2=Inlet water temp error)"}
 }
@@ -61,6 +64,7 @@ HOST_CONTROL_ON = 1
 HOST_CONTROL_OFF = 0
 COMPRESSOR_FREQ_REG = 2057
 COMPRESSOR_FREQ_VALUE = 70
+COMPRESSOR_FREQ_ACTUAL_REG = 2118  # Read-only: Actual frequency
 BRINE_PUMP_STATUS_REG = 2136
 BRINE_PUMP_BIT = 3
 ERROR_CODE_REG = 2137
@@ -80,7 +84,7 @@ def setup_logging():
     return logger
 
 logger = setup_logging()
-logger.info("Starting write_freq.py v1.8.8")
+logger.info("Starting write_freq.py v1.9.0")
 
 # Helper Functions
 def decode_bits(value, reg):
@@ -156,6 +160,7 @@ try:
     # Check brine pump status
     logger.info(f"🔎 Checking {REGISTERS[BRINE_PUMP_STATUS_REG]['name']} (Reg {BRINE_PUMP_STATUS_REG})")
     status_val = read_register(BRINE_PUMP_STATUS_REG)
+    freq_was_written = False  # Track ob Frequenz geschrieben wurde
     if status_val is None:
         success = False
     else:
@@ -163,12 +168,22 @@ try:
         pump_on = bits.get(BRINE_PUMP_BIT, 0)
         logger.info(f"💧 Brine pump {'ON' if pump_on else 'OFF'} (Bit {BRINE_PUMP_BIT} = {pump_on})")
         if pump_on:
-            logger.info("🔧 Enabling host control and setting frequency")
-            if not write_register(HOST_CONTROL_REG, HOST_CONTROL_ON):
+            # Lese aktuelle Kompressor-Frequenz
+            current_freq = read_register(COMPRESSOR_FREQ_ACTUAL_REG)
+            if current_freq is None:
+                logger.warning("⚠️ Could not read actual compressor frequency")
                 success = False
-            time.sleep(WRITE_DELAY)
-            if not write_register(COMPRESSOR_FREQ_REG, COMPRESSOR_FREQ_VALUE):
-                success = False
+            elif current_freq < COMPRESSOR_FREQ_VALUE:
+                logger.info(f"🔧 Enabling host control (current: {current_freq} Hz → target: {COMPRESSOR_FREQ_VALUE} Hz)")
+                if not write_register(HOST_CONTROL_REG, HOST_CONTROL_ON):
+                    success = False
+                time.sleep(WRITE_DELAY)
+                if not write_register(COMPRESSOR_FREQ_REG, COMPRESSOR_FREQ_VALUE):
+                    success = False
+                else:
+                    freq_was_written = True
+            else:
+                logger.info(f"✅ Target frequency already reached ({current_freq} Hz >= {COMPRESSOR_FREQ_VALUE} Hz)")
         else:
             logger.info("🔧 Disabling host control")
             if not write_register(HOST_CONTROL_REG, HOST_CONTROL_OFF):
@@ -192,7 +207,7 @@ try:
     # Verify written values
     logger.info("🔍 Verifying written registers")
     written_registers = [HOT_WATER_TANK_DELTA_T_REG, DHW_SETPOINT_REG, HOST_CONTROL_REG]
-    if pump_on:
+    if freq_was_written:  # Nur verifizieren wenn tatsächlich geschrieben
         written_registers.append(COMPRESSOR_FREQ_REG)
     for reg in written_registers:
         val = read_register(reg)

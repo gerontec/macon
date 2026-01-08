@@ -5,7 +5,7 @@ Scripts for controlling Macon geothermal heat pumps via Modbus RTU (Protocol V1.
 
 ## Files
 - **maconread2db.py**: Reads and logs up to 29 registers + 28 bits (e.g., temperatures, statuses, errors) + volumeflow.
-- **write_freq.py** (v1.8.3): Sets DHW setpoint (Reg 2004=45°C), hot water ΔT (Reg 2007=5°C), host control (Reg 2056) based on brine pump status (Reg 2136 Bit 3), compressor frequency (Reg 2057=70 Hz), checks errors (Reg 2137), and supports soft reset (Reg 2000).
+- **write_freq.py** (v1.9.0): Sets DHW setpoint (Reg 2004=46°C), hot water ΔT (Reg 2007=4°C), host control (Reg 2056) based on brine pump status (Reg 2136 Bit 3), compressor frequency (Reg 2057=70 Hz **only if current frequency < target**), checks errors (Reg 2137), and supports soft reset (Reg 2000). Smart frequency control prevents unnecessary writes.
 
 ## Setup
 - Install pymodbus: `pip3 install pymodbus`
