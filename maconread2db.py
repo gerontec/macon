@@ -8,6 +8,7 @@
 DISABLE_DB = False  # Set to True to disable all database operations and pymysql import
 
 import os
+import subprocess
 from pymodbus.client import ModbusSerialClient
 from pymodbus.exceptions import ModbusException
 from datetime import datetime
@@ -21,7 +22,17 @@ if not DISABLE_DB:
         DISABLE_DB = True
 
 # Call write_freq.py
-os.system('python3 /home/pi/python/write_freq.py')
+try:
+    result = subprocess.run(['python3', '/home/pi/python/write_freq.py'],
+                          capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        print(f"⚠️ write_freq.py failed with code {result.returncode}")
+        if result.stderr:
+            print(f"⚠️ Error: {result.stderr}")
+except subprocess.TimeoutExpired:
+    print("⚠️ write_freq.py timed out after 30 seconds")
+except Exception as e:
+    print(f"⚠️ Failed to run write_freq.py: {e}")
 # ------------------------------------------------------
 # Modbus RTU Configuration
 # ------------------------------------------------------
