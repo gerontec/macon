@@ -2,7 +2,7 @@
 # maconread2db.py — Macon Geothermal Heat Pump Modbus reader + MariaDB pivot
 # Logs all data to macon_pivot table, including Volumeflow from wagodb.mbus2
 # Calls write_freq.py for write operations
-# Version: 1.2.3
+# Version: 1.2.4
 
 # Configuration flag to disable database operations
 DISABLE_DB = False  # Set to True to disable all database operations and pymysql import
