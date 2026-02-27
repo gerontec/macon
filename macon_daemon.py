@@ -323,10 +323,12 @@ def error_check(client, log):
 
 
 VOLUMEFLOW_TOPIC = "zenner/volumeflow"   # Retained, L/h vom Zenner-Zähler
+POWER_GWP_TOPIC  = "em0/54/power_l2"    # Retained, W Grundwasserpumpe (SDM72D L2)
+POWER_HP_TOPIC   = "em0/54/power_l3"    # Retained, W Macon HP (SDM72D L3)
 
 
-def fetch_volumeflow(log) -> float | None:
-    """Liest den aktuellen Volumenstrom [L/h] vom retained MQTT-Topic."""
+def fetch_mqtt_float(topic: str, log) -> float | None:
+    """Liest einen Float-Wert von einem retained MQTT-Topic (max 2s Wartezeit)."""
     if not HAS_MQTT:
         return None
     result = [None]
@@ -339,7 +341,7 @@ def fetch_volumeflow(log) -> float | None:
         c = mqtt_client.Client()
         c.on_message = _on_msg
         c.connect(MQTT_BROKER, MQTT_PORT, keepalive=10)
-        c.subscribe(VOLUMEFLOW_TOPIC)
+        c.subscribe(topic)
         c.loop_start()
         deadline = time.time() + 2.0
         while result[0] is None and time.time() < deadline:
@@ -347,11 +349,11 @@ def fetch_volumeflow(log) -> float | None:
         c.loop_stop()
         c.disconnect()
     except Exception as e:
-        log.warning(f"Volumeflow MQTT-Fehler: {e}")
+        log.warning(f"MQTT fetch '{topic}' Fehler: {e}")
     return result[0]
 
 
-def mqtt_publish(results: dict, shelly_state, volumeflow, log):
+def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, log):
     """Veröffentlicht Status-JSON auf MQTT topic 'heatmacon'."""
     if not HAS_MQTT:
         log.debug("paho-mqtt nicht verfügbar, MQTT-Publish übersprungen")
@@ -369,8 +371,10 @@ def mqtt_publish(results: dict, shelly_state, volumeflow, log):
                 5: "DHW", 6: "auto"}
     payload["mode"]           = mode_map.get(results.get(WORKING_MODE_REG), "unknown")
     payload["freq_reduction_threshold_hz"] = results.get(2047)
-    # Volumenstrom
+    # Volumenstrom + Leistung aus SDM72D
     payload["volumeflow_lh"]  = volumeflow
+    payload["power_hp_w"]     = power_hp    # Macon HP (L3)
+    payload["power_gwp_w"]    = power_gwp   # Grundwasserpumpe (L2)
     # Fehlerregister
     for reg, info in ERROR_REGS.items():
         if reg in results:
@@ -488,9 +492,11 @@ def main():
                 results.update(extra)
                 frequency_check(client, log)
                 error_check(client, log)
-                volumeflow = fetch_volumeflow(log)
+                volumeflow = fetch_mqtt_float(VOLUMEFLOW_TOPIC, log)
+                power_gwp  = fetch_mqtt_float(POWER_GWP_TOPIC, log)
+                power_hp   = fetch_mqtt_float(POWER_HP_TOPIC, log)
                 db_insert(results, log)
-                mqtt_publish(results, shelly_state, volumeflow, log)
+                mqtt_publish(results, shelly_state, volumeflow, power_gwp, power_hp, log)
 
         except ModbusException as e:
             log.error(f"Modbus-Ausnahme: {e}")
