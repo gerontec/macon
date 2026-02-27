@@ -4,20 +4,24 @@ macon_daemon.py — Unified Macon WP Daemon
 
 Alle 2s : Modbus Reg 2136 Bit 3 lesen → Grundwasserpumpe angefordert?
           → Shelly Plug S Gen3 per HTTP ein-/ausschalten (nur bei Änderung)
+          → Proxy: /tmp/macon_cmd lesen → WP-Register schreiben
 
 Alle 60s: Alle konfigurierten Register lesen → MySQL-DB schreiben
           + Status-JSON → MQTT topic "heatmacon" (broker 192.168.178.218)
           + Kompressorfrequenz prüfen/setzen + Fehler-Auto-Reset
 
-Ersetzt:  cron-Eintrag für maconread2db.py
-          systemd-Daemon shellyplug.py daemon
+Proxy-Befehle (kein Daemon-Stopp nötig):
+  echo on    > /tmp/macon_cmd   # WP einschalten  (Reg 2000 = 1)
+  echo off   > /tmp/macon_cmd   # WP ausschalten  (Reg 2000 = 0)
+  echo reset > /tmp/macon_cmd   # Soft-Reset       (0 → 2s → 1)
 
 Systemd:  sudo systemctl start macon-daemon
 Log:      /tmp/macon_daemon.log
 
-Version: 1.1.0
+Version: 1.2.0
 """
 
+import os
 import time
 import json
 import logging
@@ -74,6 +78,10 @@ MQTT_TOPIC      = "heatmacon"
 # ─── Timing ───────────────────────────────────────────────────────────────────
 POLL_SEC        = 2    # Intervall für Grundwasserpumpen-Poll + Shelly-Steuerung
 DB_SEC          = 60   # Intervall für Register-Lesen + DB-Schreiben
+
+# ─── Proxy-Befehls-Datei ──────────────────────────────────────────────────────
+CMD_FILE        = "/tmp/macon_cmd"   # echo on|off|reset > /tmp/macon_cmd
+RESET_DELAY_SEC = 2.0
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 LOG_FILE        = '/tmp/macon_daemon.log'
@@ -157,6 +165,38 @@ def write_reg(client, addr, val, log):
     except Exception as e:
         log.error(f"Modbus Write Reg {addr}: {e}")
         return False
+
+
+# ─── Proxy: Befehls-Datei ─────────────────────────────────────────────────────
+
+def process_cmd(client, log):
+    """
+    Liest /tmp/macon_cmd, führt Befehl per Modbus aus, löscht die Datei.
+    Unterstützte Befehle: on | off | reset
+    """
+    try:
+        if not os.path.exists(CMD_FILE):
+            return
+        with open(CMD_FILE) as f:
+            cmd = f.read().strip().lower()
+        os.remove(CMD_FILE)
+    except Exception:
+        return
+
+    if cmd == "on":
+        log.info("Proxy-Befehl: WP EIN (Reg 2000 = 1)")
+        write_reg(client, UNIT_REG, 1, log)
+    elif cmd == "off":
+        log.info("Proxy-Befehl: WP AUS (Reg 2000 = 0)")
+        write_reg(client, UNIT_REG, 0, log)
+    elif cmd == "reset":
+        log.info("Proxy-Befehl: Soft-Reset (0 → 2s → 1)")
+        write_reg(client, UNIT_REG, 0, log)
+        time.sleep(RESET_DELAY_SEC)
+        write_reg(client, UNIT_REG, 1, log)
+        log.info("Proxy-Befehl: Reset abgeschlossen")
+    else:
+        log.warning(f"Proxy: unbekannter Befehl '{cmd}' (on|off|reset erwartet)")
 
 
 # ─── 60s-Tasks ────────────────────────────────────────────────────────────────
@@ -279,6 +319,9 @@ def main():
                     log.error("Verbindung fehlgeschlagen – Retry in 10 s")
                     time.sleep(10)
                     continue
+
+            # ── 2s-Task: Proxy-Befehl verarbeiten ───────────────────────────
+            process_cmd(client, log)
 
             # ── 2s-Task: Grundwasserpumpe → Shelly ──────────────────────────
             val = read_reg(client, BRINE_PUMP_REG)

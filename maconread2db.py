@@ -87,34 +87,22 @@ def write_register_safe(address, value):
         logger.error(f"{time_str} Write error: {e}")
         return False
 
-# --- CLI: EIN/AUS/RESET ---
+# --- CLI: EIN/AUS/RESET (Proxy via macon_daemon) ---
+CMD_FILE = "/tmp/macon_cmd"
+
 def control_unit(command):
+    """Schreibt Befehl in CMD_FILE – macon_daemon führt ihn im nächsten 2s-Takt aus."""
     if command not in ['on', 'off', 'reset']:
         return False
-
-    if not client.connect():
-        logger.error("Modbus connect failed")
-        return False
-
+    time_str = datetime.now().strftime("%H:%M:%S")
     try:
-        time_str = datetime.now().strftime("%H:%M:%S")
-        if command == 'reset':
-            logger.warning(f"{time_str} CLI: SOFT-RESET")
-            with open(RESET_LOG_FILE, 'a') as f:
-                f.write(f"{datetime.now()}: CLI Reset\n")
-            write_register_safe(RESET_REG, RESET_OFF)
-            time.sleep(RESET_DELAY)
-            write_register_safe(RESET_REG, RESET_ON)
-            logger.info(f"{time_str} CLI: Reset done")
-            return True
-
-        value = RESET_ON if command == 'on' else RESET_OFF
-        action = "EIN" if command == 'on' else "AUS"
-        logger.info(f"{time_str} CLI: WP {action}SCHALTEN")
-        return write_register_safe(RESET_REG, value)
-
-    finally:
-        client.close()
+        with open(CMD_FILE, 'w') as f:
+            f.write(command + "\n")
+        logger.info(f"{time_str} Proxy → '{command}' → {CMD_FILE} (daemon führt aus)")
+        return True
+    except Exception as e:
+        logger.error(f"{time_str} Proxy-Schreibfehler: {e}")
+        return False
 
 # --- FREQUENZ SETZEN (nur bei Abweichung) ---
 def write_frequency_if_needed():
