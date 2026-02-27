@@ -66,6 +66,12 @@ CURRENT_REG     = 2121   # AC-Strom [A]
 TARGET_FREQ     = 80     # Ziel-Kompressorfrequenz [Hz]
 COMPRESSOR_BIT  = 1
 
+# ─── Betriebseinstellungen (dauerhaft sicherstellen) ──────────────────────────
+WORKING_MODE_REG   = 2001   # Betriebsmodus
+WORKING_MODE_DHW   = 5      # 5 = Hot_water (DHW)
+FREQ_REDUCTION_REG = 2047   # Frequenzreduzierung
+FREQ_REDUCTION_ON  = 1      # 1 = ON
+
 # ─── Fehlerregister mit Bit-Beschreibungen ────────────────────────────────────
 ERROR_REGS = {
     2134: {
@@ -142,6 +148,7 @@ PIVOT_TABLE = "macon_pivot"
 
 # Register die alle 60s gelesen, in die DB geschrieben und per MQTT publiziert werden
 # Reg 2136 wird alle 2s extra gelesen (Shelly-Steuerung) und separat im MQTT-Payload ergänzt
+# Alle Register die gelesen und per MQTT publiziert werden
 REGISTER_MAP = {
     # Steuerung
     2000: ("unit_on_off",       ""),
@@ -151,8 +158,8 @@ REGISTER_MAP = {
     # Betrieb
     2118: ("real_frequency",    "Hz"),
     2121: ("ac_current",        "A"),
-    2135: ("system_status_2",   "bits"),
     2133: ("system_status_1",   "bits"),
+    2135: ("system_status_2",   "bits"),
     # Wassertemperaturen
     2100: ("water_tank_temp",   "C"),
     2102: ("outlet_water_temp", "C"),
@@ -165,8 +172,10 @@ REGISTER_MAP = {
     2116: ("brine_outlet_temp", "C"),
     # Umgebung
     2110: ("ambient_temp",      "C"),
-    # Fehlerregister werden via error_check() geloggt, nicht in DB gespeichert
 }
+
+# Nur diese Register werden in die DB geschrieben (bestehende Spalten in macon_pivot)
+DB_REGS = {2000, 2057, 2118, 2121, 2135}
 
 
 # ─── Logging-Setup ────────────────────────────────────────────────────────────
@@ -260,6 +269,30 @@ def process_cmd(client, log):
 
 # ─── 60s-Tasks ────────────────────────────────────────────────────────────────
 
+def settings_check(client, log) -> dict:
+    """
+    Stellt sicher dass Working_mode=DHW (Reg 2001=5) und Frequency_reduction=ON (Reg 2047=1).
+    Schreibt nur bei Abweichung. Gibt {reg: val} zurück für MQTT-Payload.
+    """
+    checks = [
+        (WORKING_MODE_REG,   WORKING_MODE_DHW,  "Working_mode=DHW"),
+        (FREQ_REDUCTION_REG, FREQ_REDUCTION_ON,  "Frequency_reduction=ON"),
+    ]
+    extra = {}
+    for reg, target, desc in checks:
+        val = read_reg(client, reg)
+        if val is None:
+            log.warning(f"Settings-Check: Lesefehler Reg {reg} ({desc})")
+        elif val != target:
+            log.warning(f"Settings-Check: Reg {reg} {desc} ist {val} → setze auf {target}")
+            write_reg(client, reg, target, log)
+            extra[reg] = target
+        else:
+            log.info(f"Settings-Check: Reg {reg} {desc} OK ({val})")
+            extra[reg] = val
+    return extra
+
+
 def frequency_check(client, log):
     """Setzt Kompressorfrequenz auf TARGET_FREQ wenn sie abweicht."""
     set_f = read_reg(client, FREQ_SET_REG)
@@ -327,14 +360,11 @@ def mqtt_publish(results: dict, shelly_state, log):
     payload["grundwasserpumpe"] = bool(
         (results.get(BRINE_PUMP_REG, 0) >> BRINE_PUMP_BIT) & 1
     )
-    # Betriebsmodus aus System status 1 (Reg 2133) dekodieren
-    s1 = results.get(2133, 0)
-    modes = []
-    if s1 & (1 << 0): modes.append("heating")
-    if s1 & (1 << 1): modes.append("cooling")
-    if s1 & (1 << 2): modes.append("DHW")
-    if s1 & (1 << 3): modes.append("defrost")
-    payload["mode"] = "+".join(modes) if modes else "standby"
+    # Betriebsmodus aus Reg 2001 (Working_mode)
+    mode_map = {0: "cooling", 1: "underfloor_heating", 2: "fan_coil_heating",
+                5: "DHW", 6: "auto"}
+    payload["mode"]           = mode_map.get(results.get(WORKING_MODE_REG), "unknown")
+    payload["freq_reduction"] = results.get(FREQ_REDUCTION_REG)
     # Fehlerregister
     for reg, info in ERROR_REGS.items():
         if reg in results:
@@ -361,9 +391,9 @@ def db_insert(results: dict, log):
             cols = ["timestamp"]
             vals = [ts]
             ph   = ["%s"]
-            for reg, (name, _) in REGISTER_MAP.items():
-                if reg in results:
-                    cols.append(name)
+            for reg in DB_REGS:
+                if reg in results and reg in REGISTER_MAP:
+                    cols.append(REGISTER_MAP[reg][0])
                     vals.append(results[reg])
                     ph.append("%s")
             cur.execute(
@@ -373,7 +403,7 @@ def db_insert(results: dict, log):
             )
         conn.commit()
         conn.close()
-        log.info(f"DB: {len(results)} Register geschrieben ({ts:%H:%M:%S})")
+        log.info(f"DB: {len(cols)-1} Spalten geschrieben ({ts:%H:%M:%S})")
     except Exception as e:
         log.error(f"DB-Fehler: {e}")
 
@@ -451,6 +481,8 @@ def main():
                     v = read_reg(client, reg)
                     if v is not None:
                         results[reg] = v
+                extra = settings_check(client, log)
+                results.update(extra)
                 frequency_check(client, log)
                 error_check(client, log)
                 db_insert(results, log)
