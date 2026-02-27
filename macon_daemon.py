@@ -143,11 +143,28 @@ PIVOT_TABLE = "macon_pivot"
 # Register die alle 60s gelesen, in die DB geschrieben und per MQTT publiziert werden
 # Reg 2136 wird alle 2s extra gelesen (Shelly-Steuerung) und separat im MQTT-Payload ergänzt
 REGISTER_MAP = {
-    2000: ("unit_on_off",     ""),
-    2057: ("set_frequency",   "Hz"),
-    2118: ("real_frequency",  "Hz"),
-    2121: ("ac_current",      "A"),
-    2135: ("system_status_2", "bits"),
+    # Steuerung
+    2000: ("unit_on_off",       ""),
+    2004: ("dhw_setpoint",      "C"),
+    2056: ("host_freq_ctrl",    ""),
+    2057: ("set_frequency",     "Hz"),
+    # Betrieb
+    2118: ("real_frequency",    "Hz"),
+    2121: ("ac_current",        "A"),
+    2135: ("system_status_2",   "bits"),
+    2133: ("system_status_1",   "bits"),
+    # Wassertemperaturen
+    2100: ("water_tank_temp",   "C"),
+    2102: ("outlet_water_temp", "C"),
+    2103: ("inlet_water_temp",  "C"),
+    # Kältekreis
+    2104: ("discharge_temp",    "C"),
+    2105: ("suction_temp",      "C"),
+    # Sole / Grundwasser
+    2115: ("brine_inlet_temp",  "C"),
+    2116: ("brine_outlet_temp", "C"),
+    # Umgebung
+    2110: ("ambient_temp",      "C"),
     # Fehlerregister werden via error_check() geloggt, nicht in DB gespeichert
 }
 
@@ -310,6 +327,15 @@ def mqtt_publish(results: dict, shelly_state, log):
     payload["grundwasserpumpe"] = bool(
         (results.get(BRINE_PUMP_REG, 0) >> BRINE_PUMP_BIT) & 1
     )
+    # Betriebsmodus aus System status 1 (Reg 2133) dekodieren
+    s1 = results.get(2133, 0)
+    modes = []
+    if s1 & (1 << 0): modes.append("heating")
+    if s1 & (1 << 1): modes.append("cooling")
+    if s1 & (1 << 2): modes.append("DHW")
+    if s1 & (1 << 3): modes.append("defrost")
+    payload["mode"] = "+".join(modes) if modes else "standby"
+    # Fehlerregister
     for reg, info in ERROR_REGS.items():
         if reg in results:
             payload[info["name"].lower().replace(" ", "_")] = results[reg]
