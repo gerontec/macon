@@ -69,8 +69,8 @@ COMPRESSOR_BIT  = 1
 # ─── Betriebseinstellungen (dauerhaft sicherstellen) ──────────────────────────
 WORKING_MODE_REG   = 2001   # Betriebsmodus
 WORKING_MODE_DHW   = 5      # 5 = Hot_water (DHW)
-FREQ_REDUCTION_REG = 2047   # Frequenzreduzierung
-FREQ_REDUCTION_ON  = 1      # 1 = ON
+# Reg 2047 = "Use frequency reduction near setpoint" — Wert ist ein Hz-Schwellwert,
+# KEIN Boolean. Macon setzt diesen intern. Pi schreibt hier NICHT rein.
 
 # ─── Fehlerregister mit Bit-Beschreibungen ────────────────────────────────────
 ERROR_REGS = {
@@ -271,39 +271,63 @@ def process_cmd(client, log):
 
 def settings_check(client, log) -> dict:
     """
-    Stellt sicher dass Working_mode=DHW (Reg 2001=5) und Frequency_reduction=ON (Reg 2047=1).
-    Schreibt nur bei Abweichung. Gibt {reg: val} zurück für MQTT-Payload.
+    Prüft Working_mode (Reg 2001) — schreibt nur bei Abweichung von DHW (5).
+    Reg 2047 wird NUR gelesen/geloggt — Macon setzt diesen intern als Hz-Schwelle,
+    der Pi schreibt dort nicht rein.
+    Gibt {reg: val} zurück für MQTT-Payload.
     """
-    checks = [
-        (WORKING_MODE_REG,   WORKING_MODE_DHW,  "Working_mode=DHW"),
-        (FREQ_REDUCTION_REG, FREQ_REDUCTION_ON,  "Frequency_reduction=ON"),
-    ]
     extra = {}
-    for reg, target, desc in checks:
-        val = read_reg(client, reg)
-        if val is None:
-            log.warning(f"Settings-Check: Lesefehler Reg {reg} ({desc})")
-        elif val != target:
-            log.warning(f"Settings-Check: Reg {reg} {desc} ist {val} → setze auf {target}")
-            write_reg(client, reg, target, log)
-            extra[reg] = target
-        else:
-            log.info(f"Settings-Check: Reg {reg} {desc} OK ({val})")
-            extra[reg] = val
+
+    # Reg 2001: Working_mode — Pi darf hier schreiben
+    val = read_reg(client, WORKING_MODE_REG)
+    if val is None:
+        log.warning("Settings-Check: Lesefehler Reg 2001 (Working_mode)")
+    elif val != WORKING_MODE_DHW:
+        log.warning(f"Settings-Check: Reg 2001 Working_mode ist {val} → setze auf {WORKING_MODE_DHW} (DHW)")
+        write_reg(client, WORKING_MODE_REG, WORKING_MODE_DHW, log)
+        extra[WORKING_MODE_REG] = WORKING_MODE_DHW
+    else:
+        log.info(f"Settings-Check: Reg 2001 Working_mode=DHW OK ({val})")
+        extra[WORKING_MODE_REG] = val
+
+    # Reg 2047: Freq-reduction-Schwelle — NUR lesen, Macon hat Hoheit
+    val47 = read_reg(client, 2047)
+    if val47 is not None:
+        log.info(f"Settings-Check: Reg 2047 freq_reduction_threshold={val47} Hz (Macon-intern, kein Schreibzugriff)")
+        extra[2047] = val47
+
     return extra
 
 
 def frequency_check(client, log):
-    """Setzt Kompressorfrequenz auf TARGET_FREQ wenn sie abweicht."""
-    set_f = read_reg(client, FREQ_SET_REG)
-    if set_f is None:
-        return
-    if set_f == TARGET_FREQ:
-        return
+    """
+    Setzt Kompressorfrequenz auf TARGET_FREQ — aber erst wenn Macon-Startup abgeschlossen.
+    Bedingungen: WP EIN + Reg 2056 lesbar (Host-Control verfügbar) + Kompressor läuft (real_freq > 0).
+    Macon hat in den ersten Minuten nach dem Start intern Vorrang.
+    """
     if read_reg(client, UNIT_REG) == 0:
         log.info("Freq-Check: WP AUS, übersprungen")
         return
-    log.info(f"Freq-Korrektur: {set_f} → {TARGET_FREQ} Hz")
+
+    # Prüfe ob Macon Host-Control bereits freigibt (Reg 2056 muss lesbar sein)
+    host_ctrl = read_reg(client, HOST_CTRL_REG)
+    if host_ctrl is None:
+        log.info("Freq-Check: Reg 2056 nicht lesbar — Macon-Startup läuft noch, warte")
+        return
+
+    # Prüfe ob Kompressor wirklich läuft (real_freq > 0)
+    real_f = read_reg(client, FREQ_REAL_REG)
+    if real_f is None or real_f == 0:
+        log.info(f"Freq-Check: Kompressor noch nicht gestartet (real_freq={real_f}), warte")
+        return
+
+    # Jetzt Host-Control übernehmen und Frequenz setzen
+    set_f = read_reg(client, FREQ_SET_REG)
+    if set_f == TARGET_FREQ and host_ctrl == 1:
+        log.info(f"Freq-Check: OK ({TARGET_FREQ} Hz, Host-Control aktiv)")
+        return
+
+    log.info(f"Freq-Check: real={real_f} Hz, set={set_f} Hz → übernehme Host-Control, setze {TARGET_FREQ} Hz")
     write_reg(client, HOST_CTRL_REG, 1, log)
     time.sleep(0.5)
     write_reg(client, FREQ_SET_REG, TARGET_FREQ, log)
@@ -364,7 +388,7 @@ def mqtt_publish(results: dict, shelly_state, log):
     mode_map = {0: "cooling", 1: "underfloor_heating", 2: "fan_coil_heating",
                 5: "DHW", 6: "auto"}
     payload["mode"]           = mode_map.get(results.get(WORKING_MODE_REG), "unknown")
-    payload["freq_reduction"] = results.get(FREQ_REDUCTION_REG)
+    payload["freq_reduction_threshold_hz"] = results.get(2047)
     # Fehlerregister
     for reg, info in ERROR_REGS.items():
         if reg in results:
