@@ -91,14 +91,14 @@ if HAS_DB:
     }
 PIVOT_TABLE = "macon_pivot"
 
-# Register die alle 60s gelesen und in die DB geschrieben werden
+# Register die alle 60s gelesen, in die DB geschrieben und per MQTT publiziert werden
+# Reg 2136 wird alle 2s extra gelesen (Shelly-Steuerung) und separat im MQTT-Payload ergänzt
 REGISTER_MAP = {
     2000: ("unit_on_off",     ""),
     2057: ("set_frequency",   "Hz"),
     2118: ("real_frequency",  "Hz"),
     2121: ("ac_current",      "A"),
     2135: ("system_status_2", "bits"),
-    2136: ("system_status_3", "bits"),
 }
 
 
