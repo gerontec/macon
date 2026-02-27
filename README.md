@@ -17,18 +17,18 @@ Raspberry Pi
 │               │
 │               ├─ every 2s : read Reg 2136 Bit 3 (Grundwasserpumpe)
 │               │             → HTTP POST → Shelly Plug S Gen3
-│               │             → check /tmp/macon_cmd (proxy commands)
 │               │
 │               └─ every 5s : settings_check + frequency_check + error_check
 │                             → read all registers → MySQL DB + MQTT heatmacon
 │
 ├─ shellyplug.py     ← manual CLI: on / off / toggle (MQTT + HTTP)
-├─ maconread2db.py   ← proxy CLI: on/off/reset → /tmp/macon_cmd → daemon
+├─ maconread2db.py   ← direct CLI: on/off/reset via Modbus (stop daemon first)
 └─ write_freq.py     ← one-shot: set compressor frequency (use only when daemon stopped)
 ```
 
 **Only `macon_daemon.py` holds the serial port.**
-All other scripts communicate via `/tmp/macon_cmd` (proxy) or are one-shot tools.
+The daemon does **not** write Reg 2000 (WP on/off). WP control is via the panel only.
+`maconread2db.py on/off/reset` requires the daemon to be stopped first.
 
 ---
 
@@ -98,18 +98,6 @@ Reads **Reg 2136 Bit 3** (System status 3). On state change only:
 | 1 | Macon requests ground-water pump → Shelly Plug **ON** |
 | 0 | No request → Shelly Plug **OFF** |
 
-### 2s loop — Proxy command file
-
-If `/tmp/macon_cmd` exists, the daemon reads it, executes via Modbus, and deletes it.
-
-```bash
-echo on    > /tmp/macon_cmd   # Reg 2000 = 1  (WP EIN)
-echo off   > /tmp/macon_cmd   # Reg 2000 = 0  (WP AUS)
-echo reset > /tmp/macon_cmd   # Reg 2000: 0 → 2s → 1  (Soft-Reset)
-```
-
-`maconread2db.py on/off/reset` writes to this file automatically.
-
 ### 5s loop — Settings watchdog (settings_check)
 
 Ensures the heat pump stays in **DHW mode**:
@@ -146,7 +134,7 @@ Once conditions are met, the Pi sets:
 
 ### 5s loop — Error monitoring (error_check)
 
-Reads all three error registers and logs active bits:
+Reads all three error registers and logs active bits. **No writes to Reg 2000.**
 
 | Register | Name | Action on non-zero |
 |----------|------|--------------------|
@@ -154,8 +142,8 @@ Reads all three error registers and logs active bits:
 | 2137 | Error code 2 | Log ERROR + active bit descriptions |
 | 2138 | Error code 3 | Log ERROR + active bit descriptions |
 
-Additionally: if compressor is running (Reg 2135 Bit 1 = 1) but AC current < 3 A,
-an **auto soft-reset** is triggered (Reg 2000: 0 → 2s → 1).
+If compressor is running (Reg 2135 Bit 1 = 1) but AC current < 3 A, a warning is
+logged only — no auto-reset. WP control is exclusively via the Macon panel.
 
 ---
 
@@ -231,12 +219,10 @@ sudo journalctl -u macon-daemon -f
 # MQTT live
 mosquitto_sub -h 192.168.178.218 -t heatmacon -C 1 | python3 -m json.tool
 
-# Heat pump control (via daemon proxy)
-echo on    > /tmp/macon_cmd
-echo off   > /tmp/macon_cmd
-echo reset > /tmp/macon_cmd
-# or:
+# Heat pump control — stop daemon first, then use maconread2db.py directly
+sudo systemctl stop macon-daemon
 python3 maconread2db.py on | off | reset
+sudo systemctl start macon-daemon
 
 # Manual Shelly (for testing)
 ./shellyplug.py on | off | toggle

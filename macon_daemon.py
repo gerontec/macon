@@ -4,24 +4,21 @@ macon_daemon.py — Unified Macon WP Daemon
 
 Alle 2s : Modbus Reg 2136 Bit 3 lesen → Grundwasserpumpe angefordert?
           → Shelly Plug S Gen3 per HTTP ein-/ausschalten (nur bei Änderung)
-          → Proxy: /tmp/macon_cmd lesen → WP-Register schreiben
 
-Alle 60s: Alle konfigurierten Register lesen → MySQL-DB schreiben
+Alle 5s : Alle konfigurierten Register lesen → MySQL-DB schreiben
           + Status-JSON → MQTT topic "heatmacon" (broker 192.168.178.218)
-          + Kompressorfrequenz prüfen/setzen + Fehler-Auto-Reset
+          + Kompressorfrequenz prüfen/setzen + Fehler-Logging
 
-Proxy-Befehle (kein Daemon-Stopp nötig):
-  echo on    > /tmp/macon_cmd   # WP einschalten  (Reg 2000 = 1)
-  echo off   > /tmp/macon_cmd   # WP ausschalten  (Reg 2000 = 0)
-  echo reset > /tmp/macon_cmd   # Soft-Reset       (0 → 2s → 1)
+Hinweis: Der Daemon schreibt Reg 2000 (WP EIN/AUS) NICHT.
+         WP-Steuerung ausschließlich über das Macon-Panel oder maconread2db.py
+         (direkter Modbus-Zugriff, nur bei gestopptem Daemon).
 
 Systemd:  sudo systemctl start macon-daemon
 Log:      /tmp/macon_daemon.log
 
-Version: 1.3.0
+Version: 1.4.0
 """
 
-import os
 import time
 import json
 import logging
@@ -125,10 +122,6 @@ MQTT_TOPIC      = "heatmacon"
 # ─── Timing ───────────────────────────────────────────────────────────────────
 POLL_SEC        = 2    # Intervall für Grundwasserpumpen-Poll + Shelly-Steuerung
 DB_SEC          = 5    # Intervall für Register-Lesen + DB-Schreiben
-
-# ─── Proxy-Befehls-Datei ──────────────────────────────────────────────────────
-CMD_FILE        = "/tmp/macon_cmd"   # echo on|off|reset > /tmp/macon_cmd
-RESET_DELAY_SEC = 2.0
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 LOG_FILE        = '/tmp/macon_daemon.log'
@@ -235,39 +228,7 @@ def write_reg(client, addr, val, log):
         return False
 
 
-# ─── Proxy: Befehls-Datei ─────────────────────────────────────────────────────
-
-def process_cmd(client, log):
-    """
-    Liest /tmp/macon_cmd, führt Befehl per Modbus aus, löscht die Datei.
-    Unterstützte Befehle: on | off | reset
-    """
-    try:
-        if not os.path.exists(CMD_FILE):
-            return
-        with open(CMD_FILE) as f:
-            cmd = f.read().strip().lower()
-        os.remove(CMD_FILE)
-    except Exception:
-        return
-
-    if cmd == "on":
-        log.info("Proxy-Befehl: WP EIN (Reg 2000 = 1)")
-        write_reg(client, UNIT_REG, 1, log)
-    elif cmd == "off":
-        log.info("Proxy-Befehl: WP AUS (Reg 2000 = 0)")
-        write_reg(client, UNIT_REG, 0, log)
-    elif cmd == "reset":
-        log.info("Proxy-Befehl: Soft-Reset (0 → 2s → 1)")
-        write_reg(client, UNIT_REG, 0, log)
-        time.sleep(RESET_DELAY_SEC)
-        write_reg(client, UNIT_REG, 1, log)
-        log.info("Proxy-Befehl: Reset abgeschlossen")
-    else:
-        log.warning(f"Proxy: unbekannter Befehl '{cmd}' (on|off|reset erwartet)")
-
-
-# ─── 60s-Tasks ────────────────────────────────────────────────────────────────
+# ─── 5s-Tasks ────────────────────────────────────────────────────────────────
 
 def settings_check(client, log) -> dict:
     """
@@ -335,11 +296,9 @@ def frequency_check(client, log):
 
 def error_check(client, log):
     """
-    1. Liest alle drei Fehlerregister (2134, 2137, 2138) und loggt aktive Bits.
-    2. Auto-Reset: Kompressor läuft aber Strom < 3 A → Soft-Reset.
+    Liest alle drei Fehlerregister (2134, 2137, 2138) und loggt aktive Bits.
+    Schreibt Reg 2000 NICHT — WP-Steuerung ausschließlich über das Panel.
     """
-    # ── Fehlerregister auslesen und dekodieren ───────────────────────────────
-    any_error = False
     for reg, info in ERROR_REGS.items():
         val = read_reg(client, reg)
         if val is None:
@@ -348,25 +307,19 @@ def error_check(client, log):
         if val == 0:
             log.info(f"Reg {reg} {info['name']}: OK (0x0000)")
         else:
-            any_error = True
             active = [desc for bit, desc in info["bits"].items() if (val >> bit) & 1]
             log.error(
                 f"Reg {reg} {info['name']}: FEHLER 0x{val:04X} — "
                 + ", ".join(active) if active else f"unbekannte Bits (0x{val:04X})"
             )
 
-    # ── Auto-Reset: Kompressor AN + Strom < 3 A ─────────────────────────────
+    # Kompressor-Status nur loggen, kein Auto-Reset mehr
     status2 = read_reg(client, COMPRESSOR_REG)
     current = read_reg(client, CURRENT_REG)
-    if status2 is None or current is None:
-        return
-    compressor_on = bool(status2 & (1 << COMPRESSOR_BIT))
-    if compressor_on and current < 3:
-        log.warning("Auto-Reset: Kompressor AN + Strom < 3 A")
-        write_reg(client, UNIT_REG, 0, log)
-        time.sleep(2)
-        write_reg(client, UNIT_REG, 1, log)
-        log.info("Auto-Reset abgeschlossen")
+    if status2 is not None and current is not None:
+        compressor_on = bool(status2 & (1 << COMPRESSOR_BIT))
+        if compressor_on and current < 3:
+            log.warning(f"Kompressor AN aber Strom < 3 A ({current} A) — kein Auto-Reset")
 
 
 def mqtt_publish(results: dict, shelly_state, log):
@@ -435,7 +388,7 @@ def db_insert(results: dict, log):
 def main():
     log = setup_logging()
     log.info("=" * 60)
-    log.info("macon_daemon v1.0.0 gestartet")
+    log.info("macon_daemon v1.4.0 gestartet")
     log.info(f"  Modbus : {MODBUS_PORT} @ {MODBUS_BAUDRATE} Baud, Slave {SLAVE_ID}")
     log.info(f"  Shelly : http://{SHELLY_IP}")
     log.info(f"  Poll   : alle {POLL_SEC}s  |  DB: alle {DB_SEC}s")
@@ -463,9 +416,6 @@ def main():
                     log.error("Verbindung fehlgeschlagen – Retry in 10 s")
                     time.sleep(10)
                     continue
-
-            # ── 2s-Task: Proxy-Befehl verarbeiten ───────────────────────────
-            process_cmd(client, log)
 
             # ── 2s-Task: Grundwasserpumpe → Shelly ──────────────────────────
             val = read_reg(client, BRINE_PUMP_REG)
