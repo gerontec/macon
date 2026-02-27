@@ -323,8 +323,8 @@ def error_check(client, log):
 
 
 VOLUMEFLOW_TOPIC = "zenner/volumeflow"   # Retained, L/h vom Zenner-Zähler
-POWER_GWP_TOPIC  = "em0/54/power_l2"    # Retained, W Grundwasserpumpe (SDM72D L2)
-POWER_HP_TOPIC   = "em0/54/power_l3"    # Retained, W Macon HP (SDM72D L3)
+POWER_GWP_TOPIC  = "em0/power_l2"       # Retained, W Grundwasserpumpe (SDM72D L2)
+POWER_HP_TOPIC   = "em0/power_l3"       # Retained, W Macon HP (SDM72D L3)
 
 
 def fetch_mqtt_float(topic: str, log) -> float | None:

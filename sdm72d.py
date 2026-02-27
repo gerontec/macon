@@ -19,7 +19,7 @@ MODBUS_BAUDRATE = 9600
 MODBUS_SLAVE_ID = 1
 LOCK_FILE = "/tmp/sdm72d.lck"
 MQTT_BROKER = "localhost"
-MQTT_BASE_TOPIC = "em0/54"          # Basis-Topic – du kannst es auch ändern
+MQTT_BASE_TOPIC = "em0"
 
 # Logging einrichten
 logging.basicConfig()
