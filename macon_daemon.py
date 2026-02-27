@@ -378,8 +378,6 @@ def mqtt_publish(results: dict, shelly_state, log):
     for reg, (name, unit) in REGISTER_MAP.items():
         if reg in results:
             payload[name] = results[reg]
-            if unit:
-                payload[name + "_unit"] = unit
     payload["shelly_on"] = shelly_state if shelly_state is not None else False
     payload["grundwasserpumpe"] = bool(
         (results.get(BRINE_PUMP_REG, 0) >> BRINE_PUMP_BIT) & 1
