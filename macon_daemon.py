@@ -18,7 +18,7 @@ Proxy-Befehle (kein Daemon-Stopp nötig):
 Systemd:  sudo systemctl start macon-daemon
 Log:      /tmp/macon_daemon.log
 
-Version: 1.2.0
+Version: 1.3.0
 """
 
 import os
@@ -60,12 +60,53 @@ HOST_CTRL_REG   = 2056   # Host-Frequenzsteuerung (0=AUS, 1=EIN)
 FREQ_SET_REG    = 2057   # Kompressor-Sollfrequenz [Hz]
 FREQ_REAL_REG   = 2118   # Kompressor-Istfrequenz  [Hz]
 UNIT_REG        = 2000   # WP Ein/Aus (0=AUS, 1=EIN)
-ERROR_REG       = 2137   # Fehlercode
 COMPRESSOR_REG  = 2135   # System status 2 — Bit 1 = Kompressor läuft
 CURRENT_REG     = 2121   # AC-Strom [A]
 
 TARGET_FREQ     = 80     # Ziel-Kompressorfrequenz [Hz]
 COMPRESSOR_BIT  = 1
+
+# ─── Fehlerregister mit Bit-Beschreibungen ────────────────────────────────────
+ERROR_REGS = {
+    2134: {
+        "name": "Error code 1",
+        "bits": {
+            0: "Outlet water temp sensor",
+            1: "Inlet water temp sensor",
+            2: "Compressor discharge temp sensor",
+            3: "Ambient temp sensor",
+            4: "Suction temp sensor",
+            5: "Brine inlet temp sensor",
+            6: "Brine outlet temp sensor",
+            7: "IPM temp sensor",
+        },
+    },
+    2137: {
+        "name": "Error code 2",
+        "bits": {
+            0: "High pressure protection",
+            1: "Low pressure protection",
+            2: "Inlet water temp error",
+            3: "Outlet water temp error",
+            4: "Compressor overload",
+            5: "Phase loss / reverse",
+            6: "AC overvoltage",
+            7: "AC undervoltage",
+            8: "Ambient temp sensor error",
+            9: "IPM overtemp",
+            10: "Compressor start failure",
+        },
+    },
+    2138: {
+        "name": "Error code 3",
+        "bits": {
+            0: "Water flow switch error",
+            1: "Brine flow switch error",
+            2: "Communication error",
+            3: "EEPROM error",
+        },
+    },
+}
 
 # ─── Shelly Plug S Gen3 ───────────────────────────────────────────────────────
 SHELLY_IP       = "192.168.178.100"
@@ -77,7 +118,7 @@ MQTT_TOPIC      = "heatmacon"
 
 # ─── Timing ───────────────────────────────────────────────────────────────────
 POLL_SEC        = 2    # Intervall für Grundwasserpumpen-Poll + Shelly-Steuerung
-DB_SEC          = 60   # Intervall für Register-Lesen + DB-Schreiben
+DB_SEC          = 5    # Intervall für Register-Lesen + DB-Schreiben
 
 # ─── Proxy-Befehls-Datei ──────────────────────────────────────────────────────
 CMD_FILE        = "/tmp/macon_cmd"   # echo on|off|reset > /tmp/macon_cmd
@@ -107,6 +148,7 @@ REGISTER_MAP = {
     2118: ("real_frequency",  "Hz"),
     2121: ("ac_current",      "A"),
     2135: ("system_status_2", "bits"),
+    # Fehlerregister werden via error_check() geloggt, nicht in DB gespeichert
 }
 
 
@@ -218,7 +260,28 @@ def frequency_check(client, log):
 
 
 def error_check(client, log):
-    """Auto-Reset: Kompressor läuft aber Strom < 3 A → Soft-Reset."""
+    """
+    1. Liest alle drei Fehlerregister (2134, 2137, 2138) und loggt aktive Bits.
+    2. Auto-Reset: Kompressor läuft aber Strom < 3 A → Soft-Reset.
+    """
+    # ── Fehlerregister auslesen und dekodieren ───────────────────────────────
+    any_error = False
+    for reg, info in ERROR_REGS.items():
+        val = read_reg(client, reg)
+        if val is None:
+            log.warning(f"Fehlerregister {reg} ({info['name']}): Lesefehler")
+            continue
+        if val == 0:
+            log.info(f"Reg {reg} {info['name']}: OK (0x0000)")
+        else:
+            any_error = True
+            active = [desc for bit, desc in info["bits"].items() if (val >> bit) & 1]
+            log.error(
+                f"Reg {reg} {info['name']}: FEHLER 0x{val:04X} — "
+                + ", ".join(active) if active else f"unbekannte Bits (0x{val:04X})"
+            )
+
+    # ── Auto-Reset: Kompressor AN + Strom < 3 A ─────────────────────────────
     status2 = read_reg(client, COMPRESSOR_REG)
     current = read_reg(client, CURRENT_REG)
     if status2 is None or current is None:
@@ -247,6 +310,9 @@ def mqtt_publish(results: dict, shelly_state, log):
     payload["grundwasserpumpe"] = bool(
         (results.get(BRINE_PUMP_REG, 0) >> BRINE_PUMP_BIT) & 1
     )
+    for reg, info in ERROR_REGS.items():
+        if reg in results:
+            payload[info["name"].lower().replace(" ", "_")] = results[reg]
     try:
         c = mqtt_client.Client()
         c.connect(MQTT_BROKER, MQTT_PORT, keepalive=10)
