@@ -7,7 +7,13 @@ Alle 2s : Modbus Reg 2136 Bit 3 lesen → Grundwasserpumpe angefordert?
 
 Alle 5s : Alle konfigurierten Register lesen → MySQL-DB schreiben
           + Status-JSON → MQTT topic "heatmacon" (broker 192.168.178.218)
-          + Kompressorfrequenz prüfen/setzen + Fehler-Logging
+          + Kompressorfrequenz prüfen/setzen (PV-Überschuss-abhängig) + Fehler-Logging
+
+PV-Überschuss-Steuerung:
+  Topic "sofar" → JSON {"ActivePower_PCC_Total": X.XX, ...} [kW]
+  0 kW Überschuss → FREQ_MIN (45 Hz)
+  >= PV_EXCESS_MAX_KW → FREQ_MAX (80 Hz = 13,2 kW thermisch)
+  Wechselrichter offline → fallback auf FREQ_MIN
 
 Hinweis: Der Daemon schreibt Reg 2000 (WP EIN/AUS) NICHT.
          WP-Steuerung ausschließlich über das Macon-Panel oder maconread2db.py
@@ -16,9 +22,22 @@ Hinweis: Der Daemon schreibt Reg 2000 (WP EIN/AUS) NICHT.
 Systemd:  sudo systemctl start macon-daemon
 Log:      /tmp/macon_daemon.log
 
-Version: 1.4.0
+Version: 1.6.0
+
+Neu in 1.6.0:
+  Brunnenschutz im Normalbetrieb (PV-Regelung):
+  brine_inlet_temp (Reg 2115) wird jetzt auch außerhalb des Sweep-Modes überwacht.
+  WARN  (< 7°C): Zielfrequenz auf max 60 Hz begrenzt
+  ALARM (< 5°C): Zielfrequenz auf max 45 Hz begrenzt
+  Hysterese 1 K, Status im MQTT-Payload als "brine_protect" (0/1/2)
+
+HK-Pumpensteuerung (neu):
+  Reg 2133 Bit 0 = heating active → WW-Pumpe EIN via pump_control.py
+  Reg 2133 Bit 0 = 0              → beide Pumpen AUTO (WAGO-intern)
+  WAGO-Host: 192.168.178.2
 """
 
+import subprocess
 import time
 import json
 import logging
@@ -53,6 +72,8 @@ SLAVE_ID        = 1
 # ─── Register-Definitionen ────────────────────────────────────────────────────
 BRINE_PUMP_REG  = 2136   # System status 3 — Bit 3 = Grundwasserpumpe angefordert
 BRINE_PUMP_BIT  = 3
+HK_PUMP_REG     = 2133   # System status 1 — Bit 0 = heating active (HK-Pumpe angefordert)
+HK_PUMP_BIT     = 0
 HOST_CTRL_REG   = 2056   # Host-Frequenzsteuerung (0=AUS, 1=EIN)
 FREQ_SET_REG    = 2057   # Kompressor-Sollfrequenz [Hz]
 FREQ_REAL_REG   = 2118   # Kompressor-Istfrequenz  [Hz]
@@ -60,14 +81,41 @@ UNIT_REG        = 2000   # WP Ein/Aus (0=AUS, 1=EIN)
 COMPRESSOR_REG  = 2135   # System status 2 — Bit 1 = Kompressor läuft
 CURRENT_REG     = 2121   # AC-Strom [A]
 
-TARGET_FREQ     = 80     # Ziel-Kompressorfrequenz [Hz]
 COMPRESSOR_BIT  = 1
+
+# ─── PV-Überschuss-Frequenzsteuerung ─────────────────────────────────────────
+# Topic "sofar": JSON {"ActivePower_PCC_Total": X.XX, ...} [kW], positiv = Einspeisung
+# Kein Überschuss → FREQ_MIN, bei PV_EXCESS_MAX_KW oder mehr → FREQ_MAX
+PV_EXCESS_TOPIC   = "fox2db/state"  # JSON: {"excess": WWWW, ...} [W]
+PV_EXCESS_MAX_W   = 3000            # W PV-Überschuss → FREQ_MAX (= 13,2 kW thermisch)
+FREQ_MIN          = 67              # Hz bei kein PV-Überschuss (Optimum aus COP-Messung)
+FREQ_MAX          = 72              # Hz bei >= PV_EXCESS_MAX_W (= besserer COP als 80 Hz)
+
+# ─── COP-Optimierungs-Sweep ───────────────────────────────────────────────────
+# SWEEP_MODE = True: Kompressor-Hz langsam erhöhen bis Brine kalt → Optimum finden
+# Danach automatisch auf False setzen (Ergebnis im Log)
+SWEEP_MODE        = False   # Sweep abgeschlossen, Optimum bei 55 Hz gefunden
+SWEEP_START_HZ    = 45
+SWEEP_MAX_HZ      = 80
+SWEEP_STEP_HZ     = 2       # Hz pro Schritt
+SWEEP_INTERVAL_S  = 240     # Sekunden pro Schritt (4 Min zum Einpendeln)
+BRINE_MIN_OUT_C   = 5.0     # Schutzgrenze Sole-Ausgang [°C]
+BRINE_MAX_DELTA_C = 6.0     # Max. Sole-Spreizung IN-OUT [K] — bei Überschreitung: -2 Hz
+
+# ─── Brunnenschutz im Normalbetrieb (PV-Regelung) ────────────────────────────
+# brine_inlet_temp (Reg 2115) = Grundwasser-Eingangstemperatur
+# Stufe 1 WARN  : brine_in < BRINE_INLET_WARN_C  → Zielfrequenz auf BRINE_FREQ_WARN begrenzen
+# Stufe 2 ALARM : brine_in < BRINE_INLET_ALARM_C → Zielfrequenz auf BRINE_FREQ_ALARM begrenzen
+# Hysterese     : Freigabe erst wieder bei brine_in > Schwelle + BRINE_HYST_K
+BRINE_INLET_WARN_C  = 7.0   # °C  — ab hier Frequenz begrenzen
+BRINE_INLET_ALARM_C = 5.0   # °C  — kritisch, starke Drosselung
+BRINE_FREQ_WARN     = 60    # Hz  — Obergrenze bei WARN
+BRINE_FREQ_ALARM    = 45    # Hz  — Obergrenze bei ALARM
+BRINE_HYST_K        = 1.0   # K   — Hysterese für Wiederfreigabe
 
 # ─── Betriebseinstellungen (dauerhaft sicherstellen) ──────────────────────────
 WORKING_MODE_REG   = 2001   # Betriebsmodus
 WORKING_MODE_DHW   = 5      # 5 = Hot_water (DHW)
-# Reg 2047 = "Use frequency reduction near setpoint" — Wert ist ein Hz-Schwellwert,
-# KEIN Boolean. Macon setzt diesen intern. Pi schreibt hier NICHT rein.
 
 # ─── Fehlerregister mit Bit-Beschreibungen ────────────────────────────────────
 ERROR_REGS = {
@@ -107,12 +155,17 @@ ERROR_REGS = {
             1: "Brine flow switch error",
             2: "Communication error",
             3: "EEPROM error",
+            8: "OEM status bit (dauerhaft, kein Fehler)",  # 0x0100, immer gesetzt
         },
     },
 }
 
 # ─── Shelly Plug S Gen3 ───────────────────────────────────────────────────────
 SHELLY_IP       = "192.168.178.100"
+
+# ─── WAGO Pumpensteuerung via pump_control.py ─────────────────────────────────
+WAGO_HOST       = "192.168.178.2"
+PUMP_CTRL       = "/home/pi/python/pump_control.py"
 
 # ─── MQTT Status-Publish ──────────────────────────────────────────────────────
 MQTT_BROKER     = "192.168.178.218"
@@ -140,8 +193,6 @@ if HAS_DB:
 PIVOT_TABLE = "macon_pivot"
 
 # Register die alle 60s gelesen, in die DB geschrieben und per MQTT publiziert werden
-# Reg 2136 wird alle 2s extra gelesen (Shelly-Steuerung) und separat im MQTT-Payload ergänzt
-# Alle Register die gelesen und per MQTT publiziert werden
 REGISTER_MAP = {
     # Steuerung
     2000: ("unit_on_off",       ""),
@@ -165,9 +216,23 @@ REGISTER_MAP = {
     2116: ("brine_outlet_temp", "C"),
     # Umgebung
     2110: ("ambient_temp",      "C"),
+    # ── OEM-Register (undokumentiert, experimentell) ──────────────────────────
+    2032: ("evap_coil_temp",    "C"),   # Kältemittel Verdampferseite (signed)
+    2039: ("low_side_temp",     "C"),   # Kältemittel Niederdruckseite (signed)
+    2107: ("ipm_temp",          "C"),   # Inverter-Modul-Temperatur
+    2108: ("cond_coil_temp",    "C"),   # Kondensator-Spulentemperatur
+    2120: ("ac_voltage",        "V"),   # AC-Eingangsspannung
+    2128: ("run_hours",         "h"),   # Betriebsstunden gesamt
+    2140: ("refrig_lo_temp",    "C"),   # Kältemittel Niederdruckbereich ×0.1 (signed)
 }
 
-# Nur diese Register werden in die DB geschrieben (bestehende Spalten in macon_pivot)
+# Signed 16-bit Register (unsigned raw → signed bei Wert ≥ 32768)
+SIGNED_REGS = {2032, 2039}
+
+# Signed + Skalierung: Wert = s16(raw) × scale
+SCALED_REGS = {2140: 0.1}
+
+# Nur diese Register werden in die DB geschrieben
 DB_REGS = {2000, 2057, 2118, 2121, 2135}
 
 
@@ -206,6 +271,22 @@ def shelly_set(on: bool, log) -> bool:
     return False
 
 
+# ─── WAGO Pumpensteuerung ─────────────────────────────────────────────────────
+
+def pump_control_call(pump: str, action: str, log) -> bool:
+    """Ruft pump_control.py für WAGO-Pumpensteuerung auf. True bei Erfolg."""
+    cmd = [sys.executable, PUMP_CTRL, "--host", WAGO_HOST, pump, action]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            log.info(f"pump_control {pump} {action} OK")
+            return True
+        log.error(f"pump_control {pump} {action} Fehler: {result.stderr.strip()[:120]}")
+    except Exception as e:
+        log.error(f"pump_control Ausführungsfehler: {e}")
+    return False
+
+
 # ─── Modbus-Hilfe ─────────────────────────────────────────────────────────────
 
 def read_reg(client, addr):
@@ -228,18 +309,164 @@ def write_reg(client, addr, val, log):
         return False
 
 
+# ─── Fehler-Tracking für schnellen 2s-Poll ───────────────────────────────────
+# Bits die dauerhaft gesetzt sind und keinen Fehler bedeuten
+_ERR_OEM_MASK = {2138: 0x0100}
+_last_err_bits: dict = {}   # {reg: masked_val beim letzten Log-Eintrag}
+
+
+def _dump_error_snapshot(client, triggered: dict, log):
+    """Liest alle Register und speichert Snapshot als JSON-Datei + Log-Eintrag."""
+    ts = datetime.now()
+    snap = {
+        "timestamp": ts.isoformat(timespec="seconds"),
+        "triggered": {str(r): f"0x{v:04X}" for r, v in triggered.items()},
+        "regs": {},
+    }
+    reg_names = {**{r: n for r, (n, _) in REGISTER_MAP.items()},
+                 **{r: info["name"] for r, info in ERROR_REGS.items()},
+                 BRINE_PUMP_REG:  "system_status_3_brine",
+                 HOST_CTRL_REG:   "host_freq_ctrl",
+                 FREQ_SET_REG:    "set_frequency",
+                 WORKING_MODE_REG: "working_mode",
+                 COMPRESSOR_REG:  "system_status_2",
+                 CURRENT_REG:     "ac_current"}
+    all_regs = list(dict.fromkeys(
+        list(REGISTER_MAP.keys()) + list(ERROR_REGS.keys()) +
+        [BRINE_PUMP_REG, HOST_CTRL_REG, FREQ_SET_REG,
+         WORKING_MODE_REG, COMPRESSOR_REG, CURRENT_REG]
+    ))
+    for r in all_regs:
+        v = read_reg(client, r)
+        name = reg_names.get(r, str(r))
+        snap["regs"][f"{r}_{name}"] = v
+    fname = f"/tmp/macon_err_{ts:%Y%m%d_%H%M%S}.json"
+    try:
+        with open(fname, "w") as f:
+            json.dump(snap, f, indent=2)
+        log.error(f"Snapshot gespeichert → {fname}")
+    except Exception as e:
+        log.warning(f"Snapshot Schreibfehler: {e}")
+    log.error(f"Snapshot Regs: { {k: v for k, v in snap['regs'].items() if v is not None} }")
+
+
+def fast_error_check(client, log):
+    """
+    Fehler-Poll für den 2s-Takt.
+    Loggt nur bei Zustandsänderung. Bei neuem Fehler: Snapshot aller Register.
+    """
+    new_errors = {}
+    for reg, info in ERROR_REGS.items():
+        val = read_reg(client, reg)
+        if val is None:
+            continue
+        masked = val & ~_ERR_OEM_MASK.get(reg, 0)
+        prev   = _last_err_bits.get(reg, 0)
+        if masked == prev:
+            continue  # keine Änderung
+        _last_err_bits[reg] = masked
+        if masked == 0:
+            log.info(f"Reg {reg} {info['name']}: Fehler gelöscht → OK")
+        else:
+            known   = [desc for bit, desc in info["bits"].items() if (masked >> bit) & 1]
+            unknown = [bit for bit in range(16)
+                       if (masked >> bit) & 1 and bit not in info["bits"]]
+            msg = f"Reg {reg} {info['name']}: 0x{val:04X} — {', '.join(known) or '?'}"
+            if unknown:
+                msg += f"  +UNBEKANNTE Bits {unknown}"
+            log.error(msg)
+            new_errors[reg] = val
+    if new_errors:
+        _dump_error_snapshot(client, new_errors, log)
+
+
+# ─── PV-Überschuss von MQTT lesen (mit Cache) ────────────────────────────────
+# fox2db/state kommt nur 1x/min und ist nicht retained → letzten Wert 90s cachen
+
+_pv_cache: dict = {"value_w": 0.0, "ts": 0.0}
+
+# ─── Sweep-State ──────────────────────────────────────────────────────────────
+_sweep: dict = {
+    "target_hz":   SWEEP_START_HZ,
+    "last_step_ts": 0.0,
+    "best_hz":     SWEEP_START_HZ,
+    "best_cop":    0.0,
+    "done":        False,
+}
+_last_cop: float = 0.0
+# Brunnenschutz-Zustand: 0=normal, 1=WARN, 2=ALARM  (Hysterese)
+_brine_protect_level: int = 0
+# Brunnen-Delta-Schutz: kumulierter Hz-Abzug wenn brine_in - brine_out > BRINE_MAX_DELTA_C
+_brine_delta_penalty_hz: int = 0
+PV_CACHE_MAX_AGE = 90  # Sekunden — danach gilt kein Überschuss mehr
+
+
+def fetch_pv_excess_kw(log) -> float:
+    """
+    Liest PV-Überschuss [W] vom MQTT-Topic 'fox2db/state'.
+    Erwartet JSON: {"excess": WWWW, ...}  (Wert in Watt)
+    Topic ist nicht retained und kommt nur 1x/min → Cache (90s).
+    Gibt 0.0 zurück wenn kein frischer Wert verfügbar.
+    """
+    if not HAS_MQTT:
+        return 0.0
+    result = [None]
+
+    def _on_msg(client, userdata, msg):
+        try:
+            data = json.loads(msg.payload.decode())
+            val = float(data.get("excess", 0.0))
+            result[0] = val
+        except Exception:
+            pass
+
+    try:
+        c = mqtt_client.Client()
+        c.on_message = _on_msg
+        c.connect(MQTT_BROKER, MQTT_PORT, keepalive=10)
+        c.subscribe(PV_EXCESS_TOPIC)
+        c.loop_start()
+        deadline = time.time() + 2.0
+        while result[0] is None and time.time() < deadline:
+            time.sleep(0.05)
+        c.loop_stop()
+        c.disconnect()
+    except Exception as e:
+        log.warning(f"MQTT fetch PV-Überschuss '{PV_EXCESS_TOPIC}': {e}")
+
+    if result[0] is not None:
+        _pv_cache["value_w"] = max(0.0, result[0])
+        _pv_cache["ts"] = time.time()
+        log.info(f"PV-Cache aktualisiert: {_pv_cache['value_w']:.0f} W")
+
+    age = time.time() - _pv_cache["ts"]
+    if age < PV_CACHE_MAX_AGE:
+        return _pv_cache["value_w"]
+
+    # Cache abgelaufen → kein Überschuss
+    return 0.0
+
+
+def pv_excess_to_freq(pv_excess_w: float) -> int:
+    """
+    Berechnet Ziel-Kompressorfrequenz [Hz] aus PV-Überschuss [W].
+    Lineare Skalierung: 0 W → FREQ_MIN (45 Hz), >= PV_EXCESS_MAX_W (3000 W) → FREQ_MAX (80 Hz).
+    """
+    if PV_EXCESS_MAX_W <= 0:
+        return FREQ_MIN
+    ratio = min(1.0, pv_excess_w / PV_EXCESS_MAX_W)
+    return round(FREQ_MIN + ratio * (FREQ_MAX - FREQ_MIN))
+
+
 # ─── 5s-Tasks ────────────────────────────────────────────────────────────────
 
 def settings_check(client, log) -> dict:
     """
     Prüft Working_mode (Reg 2001) — schreibt nur bei Abweichung von DHW (5).
-    Reg 2047 wird NUR gelesen/geloggt — Macon setzt diesen intern als Hz-Schwelle,
-    der Pi schreibt dort nicht rein.
     Gibt {reg: val} zurück für MQTT-Payload.
     """
     extra = {}
 
-    # Reg 2001: Working_mode — Pi darf hier schreiben
     val = read_reg(client, WORKING_MODE_REG)
     if val is None:
         log.warning("Settings-Check: Lesefehler Reg 2001 (Working_mode)")
@@ -251,7 +478,6 @@ def settings_check(client, log) -> dict:
         log.info(f"Settings-Check: Reg 2001 Working_mode=DHW OK ({val})")
         extra[WORKING_MODE_REG] = val
 
-    # Reg 2047: Freq-reduction-Schwelle — NUR lesen, Macon hat Hoheit
     val47 = read_reg(client, 2047)
     if val47 is not None:
         log.info(f"Settings-Check: Reg 2047 freq_reduction_threshold={val47} Hz (Macon-intern, kein Schreibzugriff)")
@@ -260,44 +486,163 @@ def settings_check(client, log) -> dict:
     return extra
 
 
-def frequency_check(client, log):
+def frequency_check(client, pv_excess_w: float, log, brine_out_c=None, brine_in_c=None):
     """
-    Setzt Kompressorfrequenz auf TARGET_FREQ — aber erst wenn Macon-Startup abgeschlossen.
-    Bedingungen: WP EIN + Reg 2056 lesbar (Host-Control verfügbar) + Kompressor läuft (real_freq > 0).
-    Macon hat in den ersten Minuten nach dem Start intern Vorrang.
+    Setzt Kompressorfrequenz.
+    Im SWEEP_MODE: langsam Hz erhöhen, Brine-Delta + Brine-OUT überwachen.
+    Sonst: PV-Überschuss-abhängige Regelung.
     """
     if read_reg(client, UNIT_REG) == 0:
         log.info("Freq-Check: WP AUS, übersprungen")
         return
 
-    # Prüfe ob Macon Host-Control bereits freigibt (Reg 2056 muss lesbar sein)
     host_ctrl = read_reg(client, HOST_CTRL_REG)
     if host_ctrl is None:
         log.info("Freq-Check: Reg 2056 nicht lesbar — Macon-Startup läuft noch, warte")
         return
 
-    # Prüfe ob Kompressor wirklich läuft (real_freq > 0)
     real_f = read_reg(client, FREQ_REAL_REG)
     if real_f is None or real_f == 0:
         log.info(f"Freq-Check: Kompressor noch nicht gestartet (real_freq={real_f}), warte")
         return
 
-    # Jetzt Host-Control übernehmen und Frequenz setzen
-    set_f = read_reg(client, FREQ_SET_REG)
-    if set_f == TARGET_FREQ and host_ctrl == 1:
-        log.info(f"Freq-Check: OK ({TARGET_FREQ} Hz, Host-Control aktiv)")
+    if SWEEP_MODE and not _sweep["done"]:
+        now = time.time()
+        target = _sweep["target_hz"]
+
+        brine_delta = round(brine_in_c - brine_out_c, 1) if (brine_in_c is not None and brine_out_c is not None) else None
+        brine_str = (f"Brine {brine_in_c:.1f}→{brine_out_c:.1f}°C  ΔT={brine_delta}K"
+                     if brine_delta is not None else "Brine n/a")
+
+        # Brine-OUT zu kalt → Sweep beenden
+        if brine_out_c is not None and brine_out_c < BRINE_MIN_OUT_C:
+            log.warning(
+                f"Sweep: {brine_str}  Brine OUT < {BRINE_MIN_OUT_C}°C "
+                f"— Grenze bei {target} Hz, halte"
+            )
+            _sweep["done"] = True
+
+        # Brine-Delta zu groß → 2 Hz zurück
+        elif brine_delta is not None and brine_delta > BRINE_MAX_DELTA_C:
+            new_target = max(SWEEP_START_HZ, target - SWEEP_STEP_HZ)
+            _sweep["target_hz"] = new_target
+            _sweep["last_step_ts"] = now
+            log.warning(
+                f"Sweep: {brine_str}  Delta > {BRINE_MAX_DELTA_C}K "
+                f"→ {target} Hz → {new_target} Hz"
+            )
+            target = new_target
+
+        # Zeit für nächsten Schritt
+        elif now - _sweep["last_step_ts"] >= SWEEP_INTERVAL_S:
+            if target < SWEEP_MAX_HZ:
+                target = min(SWEEP_MAX_HZ, target + SWEEP_STEP_HZ)
+                _sweep["target_hz"] = target
+                _sweep["last_step_ts"] = now
+                log.info(
+                    f"Sweep: → {target} Hz  {brine_str}  "
+                    f"COP={_last_cop:.2f}  Bestes: {_sweep['best_hz']} Hz/COP {_sweep['best_cop']:.2f}"
+                )
+            else:
+                _sweep["done"] = True
+                log.info(f"Sweep: Maximum {SWEEP_MAX_HZ} Hz erreicht — fertig")
+
+        # COP-Tracking
+        if _last_cop > _sweep["best_cop"]:
+            _sweep["best_cop"] = _last_cop
+            _sweep["best_hz"]  = target
+
+        set_f = read_reg(client, FREQ_SET_REG)
+        if set_f != target or host_ctrl != 1:
+            write_reg(client, HOST_CTRL_REG, 1, log)
+            time.sleep(0.5)
+            write_reg(client, FREQ_SET_REG, target, log)
+        else:
+            log.info(
+                f"Sweep: {target} Hz (real={real_f})  {brine_str}  COP={_last_cop:.2f}"
+            )
         return
 
-    log.info(f"Freq-Check: real={real_f} Hz, set={set_f} Hz → übernehme Host-Control, setze {TARGET_FREQ} Hz")
+    # ── Normal: PV-Überschuss-Regelung ──────────────────────────────────────
+    global _brine_protect_level
+    target_freq = pv_excess_to_freq(pv_excess_w)
+
+    # ── Brunnenschutz: brine_in_c (Reg 2115) überwachen ─────────────────────
+    if brine_in_c is not None:
+        if _brine_protect_level >= 2:
+            # ALARM aktiv: erst freigeben wenn brine_in > ALARM + Hysterese
+            if brine_in_c >= BRINE_INLET_ALARM_C + BRINE_HYST_K:
+                _brine_protect_level = 1  # zurück auf WARN
+                log.info(f"Brunnen-Schutz: ALARM aufgehoben (brine_in={brine_in_c:.1f}°C), zurück auf WARN")
+        if _brine_protect_level >= 1:
+            # WARN aktiv: erst freigeben wenn brine_in > WARN + Hysterese
+            if brine_in_c >= BRINE_INLET_WARN_C + BRINE_HYST_K:
+                _brine_protect_level = 0
+                log.info(f"Brunnen-Schutz: WARN aufgehoben (brine_in={brine_in_c:.1f}°C), Normalbetrieb")
+
+        # Neue Alarme setzen (Hysterese: nur verschärfen, nie direktes Herabsetzen)
+        if brine_in_c < BRINE_INLET_ALARM_C:
+            if _brine_protect_level < 2:
+                _brine_protect_level = 2
+                log.warning(
+                    f"Brunnen-Schutz ALARM: brine_in={brine_in_c:.1f}°C "
+                    f"< {BRINE_INLET_ALARM_C}°C → Freq auf max {BRINE_FREQ_ALARM} Hz begrenzt!"
+                )
+        elif brine_in_c < BRINE_INLET_WARN_C:
+            if _brine_protect_level < 1:
+                _brine_protect_level = 1
+                log.warning(
+                    f"Brunnen-Schutz WARN: brine_in={brine_in_c:.1f}°C "
+                    f"< {BRINE_INLET_WARN_C}°C → Freq auf max {BRINE_FREQ_WARN} Hz begrenzt"
+                )
+
+    # Zielfrequenz nach Schutzstufe deckeln
+    if _brine_protect_level >= 2:
+        target_freq = min(target_freq, BRINE_FREQ_ALARM)
+    elif _brine_protect_level >= 1:
+        target_freq = min(target_freq, BRINE_FREQ_WARN)
+
+    # ── Brunnen-Delta-Schutz: brine_in - brine_out überwachen ──────────────
+    global _brine_delta_penalty_hz
+    if brine_in_c is not None and brine_out_c is not None:
+        brine_delta = round(brine_in_c - brine_out_c, 1)
+        if brine_delta > BRINE_MAX_DELTA_C:
+            _brine_delta_penalty_hz = min(_brine_delta_penalty_hz + SWEEP_STEP_HZ, 20)
+            log.warning(
+                f"Brunnen-Delta: {brine_delta}K > {BRINE_MAX_DELTA_C}K "
+                f"→ Freq -{_brine_delta_penalty_hz} Hz (Abzug kumuliert)"
+            )
+        elif brine_delta <= BRINE_MAX_DELTA_C - BRINE_HYST_K and _brine_delta_penalty_hz > 0:
+            _brine_delta_penalty_hz = max(0, _brine_delta_penalty_hz - SWEEP_STEP_HZ)
+            log.info(
+                f"Brunnen-Delta: {brine_delta}K OK "
+                f"→ Freq-Abzug auf -{_brine_delta_penalty_hz} Hz reduziert"
+            )
+        if _brine_delta_penalty_hz > 0:
+            target_freq = max(BRINE_FREQ_ALARM, target_freq - _brine_delta_penalty_hz)
+    else:
+        brine_delta = None
+
+    brine_delta_str = f"  Δbrine={brine_delta}K" if brine_delta is not None else ""
+    brine_str = (f"brine_in={brine_in_c:.1f}°C" if brine_in_c is not None else "brine_in=n/a") + brine_delta_str
+
+    set_f = read_reg(client, FREQ_SET_REG)
+    if set_f == target_freq and host_ctrl == 1:
+        log.info(f"Freq-Check: OK ({target_freq} Hz, PV={pv_excess_w:.0f} W, Host-Control aktiv)  [{brine_str}]")
+        return
+
+    log.info(
+        f"Freq-Check: real={real_f} Hz, set={set_f} Hz → "
+        f"PV-Überschuss={pv_excess_w:.0f} W → Ziel={target_freq} Hz  [{brine_str}]"
+    )
     write_reg(client, HOST_CTRL_REG, 1, log)
     time.sleep(0.5)
-    write_reg(client, FREQ_SET_REG, TARGET_FREQ, log)
+    write_reg(client, FREQ_SET_REG, target_freq, log)
 
 
 def error_check(client, log):
     """
     Liest alle drei Fehlerregister (2134, 2137, 2138) und loggt aktive Bits.
-    Schreibt Reg 2000 NICHT — WP-Steuerung ausschließlich über das Panel.
     """
     for reg, info in ERROR_REGS.items():
         val = read_reg(client, reg)
@@ -305,15 +650,16 @@ def error_check(client, log):
             log.warning(f"Fehlerregister {reg} ({info['name']}): Lesefehler")
             continue
         if val == 0:
-            log.info(f"Reg {reg} {info['name']}: OK (0x0000)")
+            continue
         else:
-            active = [desc for bit, desc in info["bits"].items() if (val >> bit) & 1]
-            log.error(
-                f"Reg {reg} {info['name']}: FEHLER 0x{val:04X} — "
-                + ", ".join(active) if active else f"unbekannte Bits (0x{val:04X})"
-            )
+            known   = [desc for bit, desc in info["bits"].items() if (val >> bit) & 1]
+            unknown = [bit for bit in range(16)
+                       if (val >> bit) & 1 and bit not in info["bits"]]
+            if unknown:
+                log.error(f"Reg {reg} {info['name']}: UNBEKANNTE Bits 0x{val:04X} — Bits {unknown}")
+            else:
+                log.info(f"Reg {reg} {info['name']}: 0x{val:04X} — {', '.join(known)}")
 
-    # Kompressor-Status nur loggen, kein Auto-Reset mehr
     status2 = read_reg(client, COMPRESSOR_REG)
     current = read_reg(client, CURRENT_REG)
     if status2 is not None and current is not None:
@@ -321,10 +667,11 @@ def error_check(client, log):
         if compressor_on and current < 3:
             log.warning(f"Kompressor AN aber Strom < 3 A ({current} A) — kein Auto-Reset")
 
-
-VOLUMEFLOW_TOPIC = "zenner/volumeflow"   # Retained, L/h vom Zenner-Zähler
-POWER_GWP_TOPIC  = "em0/power_l2"       # Retained, W Grundwasserpumpe (SDM72D L2)
-POWER_HP_TOPIC   = "em0/power_l3"       # Retained, W Macon HP (SDM72D L3)
+POWER_ZENNER_TOPIC = "zenner/power"
+VOLUMEFLOW_TOPIC = "zenner/volumeflow"
+POWER_GWP_TOPIC  = "em0/power_l2"
+POWER_HP_TOPIC   = "em0/power_l3"
+TANK_TEMP_TOPIC  = "tuya/heatpump/tank_temp"  # Pufferspeicher °C (retained)
 
 
 def fetch_mqtt_float(topic: str, log) -> float | None:
@@ -353,7 +700,7 @@ def fetch_mqtt_float(topic: str, log) -> float | None:
     return result[0]
 
 
-def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, log):
+def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, power_zenner, pv_excess_w: float, log):
     """Veröffentlicht Status-JSON auf MQTT topic 'heatmacon'."""
     if not HAS_MQTT:
         log.debug("paho-mqtt nicht verfügbar, MQTT-Publish übersprungen")
@@ -366,16 +713,20 @@ def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, l
     payload["grundwasserpumpe"] = bool(
         (results.get(BRINE_PUMP_REG, 0) >> BRINE_PUMP_BIT) & 1
     )
-    # Betriebsmodus aus Reg 2001 (Working_mode)
     mode_map = {0: "cooling", 1: "underfloor_heating", 2: "fan_coil_heating",
                 5: "DHW", 6: "auto"}
     payload["mode"]           = mode_map.get(results.get(WORKING_MODE_REG), "unknown")
     payload["freq_reduction_threshold_hz"] = results.get(2047)
-    # Volumenstrom + Leistung aus SDM72D
     payload["volumeflow_lh"]  = volumeflow
-    payload["power_hp_w"]     = power_hp    # Macon HP (L3)
-    payload["power_gwp_w"]    = power_gwp   # Grundwasserpumpe (L2)
-    # Fehlerregister
+    payload["power_zenner_w"] = power_zenner
+    payload["power_hp_w"]     = power_hp
+    payload["power_gwp_w"]    = power_gwp
+    # PV-Überschuss und Zielfrequenz
+    payload["pv_excess_w"]    = round(pv_excess_w, 0)
+    payload["freq_target_hz"] = pv_excess_to_freq(pv_excess_w)
+    payload["brine_protect"]  = _brine_protect_level  # 0=OK, 1=WARN, 2=ALARM
+    tank_temp_c = fetch_mqtt_float(TANK_TEMP_TOPIC, log)
+    payload["tank_temp_tuya_c"] = tank_temp_c
     for reg, info in ERROR_REGS.items():
         if reg in results:
             payload[info["name"].lower().replace(" ", "_")] = results[reg]
@@ -384,7 +735,40 @@ def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, l
         c.connect(MQTT_BROKER, MQTT_PORT, keepalive=10)
         c.publish(MQTT_TOPIC, json.dumps(payload), retain=True)
         c.disconnect()
-        log.info(f"MQTT: {MQTT_TOPIC} ← {len(payload)} Felder")
+        try:
+            dt = results.get(2102, 0) - results.get(2103, 0)
+            vf = volumeflow if volumeflow else 0
+            q_total = power_zenner if power_zenner is not None else 0
+            p_total = (power_hp or 0) + (power_gwp or 0)
+            cop = round(q_total / p_total, 2) if p_total > 0 and q_total > 0 else None
+            payload["q_total_w"]  = round(q_total, 1)
+            payload["cop"]        = cop
+            payload["delta_t_k"]  = dt
+            if cop:
+                global _last_cop
+                _last_cop = cop
+                log.info(f"COP: {cop:.2f}  Q={q_total:.0f}W  P={p_total:.0f}W  [Zenner]  ΔT_mod={dt}K  flow={vf:.3f}m³/h")
+                real_freq = results.get(FREQ_REAL_REG, 0)
+                try:
+                    with open("/home/pi/cop.csv", "a") as f:
+                        ts = datetime.now().isoformat(timespec="seconds")
+                        evap  = results.get(2032, "")
+                        lo    = results.get(2039, "")
+                        cond  = results.get(2108, "")
+                        rlo   = results.get(2140, "")
+                        ipm   = results.get(2107, "")
+                        brine_in_r  = results.get(2115)
+                        brine_out_r = results.get(2116)
+                        brine_delta = round(brine_in_r - brine_out_r, 1) if (brine_in_r is not None and brine_out_r is not None) else ""
+                        p_hp  = round(power_hp  or 0)
+                        p_gwp = round(power_gwp or 0)
+                        f.write(f"{ts},{real_freq},{cop},{round(q_total)},{round(p_total)},{p_hp},{p_gwp},{dt},{vf:.3f},{evap},{lo},{cond},{rlo},{ipm},{brine_delta}\n")
+                except Exception as e:
+                    log.warning(f"COP-File Schreibfehler: {e}")
+        except Exception as e:
+            log.warning(f"COP-Berechnung Fehler: {e}")
+        tank_str = f"  Tank={tank_temp_c:.0f}°C" if tank_temp_c is not None else ""
+        log.info(f"MQTT: {MQTT_TOPIC} ← {len(payload)} Felder  PV={pv_excess_w:.0f} W → {pv_excess_to_freq(pv_excess_w)} Hz{tank_str}")
     except Exception as e:
         log.error(f"MQTT-Publish-Fehler: {e}")
 
@@ -423,11 +807,13 @@ def db_insert(results: dict, log):
 def main():
     log = setup_logging()
     log.info("=" * 60)
-    log.info("macon_daemon v1.4.0 gestartet")
+    log.info("macon_daemon v1.6.0 gestartet")
     log.info(f"  Modbus : {MODBUS_PORT} @ {MODBUS_BAUDRATE} Baud, Slave {SLAVE_ID}")
     log.info(f"  Shelly : http://{SHELLY_IP}")
     log.info(f"  Poll   : alle {POLL_SEC}s  |  DB: alle {DB_SEC}s")
     log.info(f"  DB     : {'aktiv' if HAS_DB else 'DEAKTIVIERT (pymysql fehlt)'}")
+    log.info(f"  PV     : topic='{PV_EXCESS_TOPIC}'  {FREQ_MIN} Hz (0 W) → {FREQ_MAX} Hz (>={PV_EXCESS_MAX_W} W)")
+    log.info(f"  WAGO   : {WAGO_HOST}  HK-Pumpe: Reg {HK_PUMP_REG} Bit {HK_PUMP_BIT}")
     log.info("=" * 60)
 
     client = ModbusSerialClient(
@@ -439,12 +825,22 @@ def main():
         timeout=MODBUS_TIMEOUT,
     )
 
-    shelly_state = None   # None = Initialzustand unbekannt
-    last_db_time = 0.0
+    shelly_state  = None
+    hk_pump_state = None   # None = unbekannt, True/False = letzter Zustand
+    last_db_time  = 0.0
+
+    # COP-Log anlegen falls noch nicht vorhanden
+    cop_file = "/home/pi/cop.csv"
+    try:
+        import os
+        if not os.path.exists(cop_file):
+            with open(cop_file, "w") as f:
+                f.write("timestamp,freq_hz,cop,q_w,p_w,p_macon_w,p_gwp_w,delta_t_k,flow_m3h,evap_coil_c,low_side_c,cond_coil_c,refrig_lo_c,ipm_c,brine_delta_k\n")
+    except Exception:
+        pass
 
     while True:
         try:
-            # Verbindung sicherstellen
             if not client.connected:
                 log.info("Modbus: verbinde …")
                 if not client.connect():
@@ -479,7 +875,34 @@ def main():
             else:
                 log.warning(f"Lesefehler Reg {BRINE_PUMP_REG}")
 
-            # ── 60s-Task: Alle Register + DB + MQTT + Frequenz + Fehler ────
+            # ── 2s-Task: HK-Pumpe (Reg 2133 Bit 0) → pump_control.py ────────
+            hk_val = read_reg(client, HK_PUMP_REG)
+            if hk_val is not None:
+                hk = bool((hk_val >> HK_PUMP_BIT) & 1)
+                if hk and hk_pump_state is not True:
+                    log.info(
+                        f"Reg {HK_PUMP_REG}=0x{hk_val:04X} Bit{HK_PUMP_BIT}=1 "
+                        f"→ HK-Pumpe angefordert → HK+WW-Pumpe EIN"
+                    )
+                    if pump_control_call("both", "auto", log):
+                        hk_pump_state = True
+                    else:
+                        log.error("pump_control both auto fehlgeschlagen – nächster Versuch in 2 s")
+                elif not hk and hk_pump_state is not False:
+                    log.info(
+                        f"Reg {HK_PUMP_REG}=0x{hk_val:04X} Bit{HK_PUMP_BIT}=0 "
+                        f"→ keine HK-Anforderung → beide Pumpen Automatik"
+                    )
+                    if pump_control_call("both", "on", log):
+                        hk_pump_state = False
+                    else:
+                        log.error("pump_control both on fehlgeschlagen – nächster Versuch in 2 s")
+            else:
+                log.warning(f"Lesefehler Reg {HK_PUMP_REG}")
+
+            fast_error_check(client, log)
+
+            # ── 5s-Task: Alle Register + DB + MQTT + Frequenz + Fehler ─────
             now = time.time()
             if now - last_db_time >= DB_SEC:
                 last_db_time = now
@@ -487,16 +910,24 @@ def main():
                 for reg in REGISTER_MAP:
                     v = read_reg(client, reg)
                     if v is not None:
+                        if reg in SCALED_REGS:
+                            v = round((v if v < 32768 else v - 65536) * SCALED_REGS[reg], 1)
+                        elif reg in SIGNED_REGS:
+                            v = v if v < 32768 else v - 65536
                         results[reg] = v
                 extra = settings_check(client, log)
                 results.update(extra)
-                frequency_check(client, log)
-                error_check(client, log)
-                volumeflow = fetch_mqtt_float(VOLUMEFLOW_TOPIC, log)
-                power_gwp  = fetch_mqtt_float(POWER_GWP_TOPIC, log)
-                power_hp   = fetch_mqtt_float(POWER_HP_TOPIC, log)
+                # PV-Überschuss holen und Frequenz setzen
+                pv_excess_w = fetch_pv_excess_kw(log)
+                frequency_check(client, pv_excess_w, log,
+                                brine_out_c=results.get(2116),
+                                brine_in_c=results.get(2115))
+                volumeflow   = fetch_mqtt_float(VOLUMEFLOW_TOPIC, log)
+                power_gwp    = fetch_mqtt_float(POWER_GWP_TOPIC, log)
+                power_hp     = fetch_mqtt_float(POWER_HP_TOPIC, log)
+                power_zenner = fetch_mqtt_float(POWER_ZENNER_TOPIC, log)
                 db_insert(results, log)
-                mqtt_publish(results, shelly_state, volumeflow, power_gwp, power_hp, log)
+                mqtt_publish(results, shelly_state, volumeflow, power_gwp, power_hp, power_zenner, pv_excess_w, log)
 
         except ModbusException as e:
             log.error(f"Modbus-Ausnahme: {e}")
