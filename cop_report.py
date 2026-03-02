@@ -86,6 +86,14 @@ HAVING cop IS NOT NULL AND cop <= 6
 ORDER BY s.hour DESC
 """
 
+# ── Heizkurve ────────────────────────────────────────────────────────────────
+def heat_curve(t_out, t_norm=-12.0, t_room=20.0, t_flow_norm=45.0,
+               t_flow_min=20.0, t_flow_max=55.0):
+    if t_out >= t_room:
+        return t_flow_min
+    vl = t_room + (t_flow_norm - t_room) * (t_room - t_out) / (t_room - t_norm)
+    return max(t_flow_min, min(t_flow_max, round(vl, 1)))
+
 # ── Ausgabe ──────────────────────────────────────────────────────────────────
 def bar(cop, width=20):
     """Einfacher ASCII-Balken für COP-Visualisierung (max COP=6)."""
@@ -111,10 +119,10 @@ def main():
     # Header
     print()
     print(f"  COP-Stundenbericht  |  {start_str[:10]}  bis  {end_str[:10]}")
-    print("─" * 104)
+    print("─" * 113)
     print(f"  {'Stunde':<16}  {'El[kWh]':>7}  {'Th[kWh]':>7}  {'COP':>5}  "
-          f"{'VL°C':>5}  {'RL°C':>5}  {'ΔT':>4}  {'l/h':>6}  {'Aus°C':>5}  COP-Balken")
-    print("─" * 104)
+          f"{'VL°C':>5}  {'RL°C':>5}  {'ΔT':>4}  {'l/h':>6}  {'Aus°C':>5}  {'VL-Soll':>7}  COP-Balken")
+    print("─" * 113)
 
     cop_sum = 0.0
     cop_count = 0
@@ -127,7 +135,13 @@ def main():
         # Volumeflow: m³/h → l/h
         vf_lh = round(r["volumeflow_m3h"] * 1000) if r["volumeflow_m3h"] else 0
 
-        aussen = f"{r['aussen_c']:>5.1f}" if r['aussen_c'] is not None else "    –"
+        aussen  = f"{r['aussen_c']:>5.1f}" if r['aussen_c'] is not None else "    –"
+        if r['aussen_c'] is not None:
+            vl_s = heat_curve(float(r['aussen_c']))
+            hs   = " ⚡" if vl_s > 39.0 else ""
+            vl_soll = f"{vl_s:>5.1f}{hs}"
+        else:
+            vl_soll = "      –"
         print(
             f"  {r['stunde']:<16}  "
             f"{r['el_kwh']:>7.3f}  "
@@ -138,13 +152,14 @@ def main():
             f"{r['delta_t']:>4.1f}  "
             f"{vf_lh:>6}  "
             f"{aussen}  "
+            f"{vl_soll}  "
             f"{bar(cop_val)}"
         )
 
-    print("─" * 104)
+    print("─" * 113)
     if cop_count:
         print(f"  {'Ø COP':<16}  {'':>7}  {'':>7}  {cop_sum/cop_count:>5.2f}  "
-              f"{'':>5}  {'':>5}  {'':>4}  {'':>6}  {'':>5}  {bar(cop_sum/cop_count)}")
+              f"{'':>5}  {'':>5}  {'':>4}  {'':>6}  {'':>5}  {'':>7}  {bar(cop_sum/cop_count)}")
     print()
 
 if __name__ == "__main__":
