@@ -126,11 +126,15 @@ def main():
 
     cop_sum = 0.0
     cop_count = 0
+    el_sum  = 0.0
+    th_sum  = 0.0
 
     for r in rows:
         cop_val = r["cop"] if r["cop"] is not None else 0.0
         cop_sum += cop_val
         cop_count += 1
+        el_sum  += float(r["el_kwh"] or 0)
+        th_sum  += float(r["th_kwh"] or 0)
 
         # Volumeflow: m³/h → l/h
         vf_lh = round(r["volumeflow_m3h"] * 1000) if r["volumeflow_m3h"] else 0
@@ -158,8 +162,12 @@ def main():
 
     print("─" * 113)
     if cop_count:
-        print(f"  {'Ø COP':<16}  {'':>7}  {'':>7}  {cop_sum/cop_count:>5.2f}  "
-              f"{'':>5}  {'':>5}  {'':>4}  {'':>6}  {'':>5}  {'':>7}  {bar(cop_sum/cop_count)}")
+        cop_avg   = cop_sum / cop_count
+        cop_total = th_sum / el_sum if el_sum else 0.0
+        print(f"  {'Ø COP':<16}  {'':>7}  {'':>7}  {cop_avg:>5.2f}  "
+              f"{'':>5}  {'':>5}  {'':>4}  {'':>6}  {'':>5}  {'':>7}  {bar(cop_avg)}")
+        print(f"  {'Σ':<16}  {el_sum:>7.3f}  {th_sum:>7.3f}  {cop_total:>5.2f}  "
+              f"{'':>5}  {'':>5}  {'':>4}  {'':>6}  {'':>5}  {'':>7}  {bar(cop_total)}")
     print()
 
 if __name__ == "__main__":
