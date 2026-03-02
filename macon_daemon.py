@@ -117,6 +117,7 @@ FREQ_FIXED        = 55              # Hz Festfrequenz (Optimum aus Sweep)
 BRINE_WARM_HZ     = 67              # Hz wenn Sole warm (brine_out > 4°C)
 BRINE_MIN_OUT_C   = 5.0             # Schutzgrenze Sole-Ausgang [°C]
 DISCHARGE_MAX_C   = 64              # Schutzabschaltung: Heißgas-Temperatur [°C]
+RL_MAX_C          = 39              # Abschaltung wenn Rücklauf > 39°C (COP <2, Taktbetrieb)
 
 # ─── Betriebseinstellungen (dauerhaft sicherstellen) ──────────────────────────
 WORKING_MODE_REG   = 2001   # Betriebsmodus
@@ -217,6 +218,7 @@ WHERE s.timestamp >= %s
 REGISTER_MAP = {
     # Steuerung
     2000: ("unit_on_off",       ""),
+    2003: ("heating_setpoint",  "C"),
     2004: ("dhw_setpoint",      "C"),
     2056: ("host_freq_ctrl",    ""),
     2057: ("set_frequency",     "Hz"),
@@ -743,7 +745,7 @@ def db_insert(results: dict, cop_2h, log):
 def main():
     log = setup_logging()
     log.info("=" * 60)
-    log.info("macon_daemon v1.8.0 gestartet")
+    log.info("macon_daemon v1.9.0 gestartet")
     log.info(f"  Modbus : {MODBUS_PORT} @ {MODBUS_BAUDRATE} Baud, Slave {SLAVE_ID}")
     log.info(f"  Shelly : http://{SHELLY_IP}")
     log.info(f"  Poll   : alle {POLL_SEC}s  |  DB: alle {DB_SEC}s")
@@ -767,6 +769,7 @@ def main():
     hk_pump_state     = None   # None = unbekannt, True/False = letzter Zustand
     last_db_time      = 0.0
     last_db_insert    = 0.0
+    last_freq_time    = 0.0
     _cached_cop_2h    = None   # COP-Cache, wird beim 60s-Insert aktualisiert
 
     # COP-Log anlegen falls noch nicht vorhanden
@@ -858,8 +861,10 @@ def main():
                 if discharge_protect(client, results, log):
                     time.sleep(POLL_SEC)
                     continue
-                frequency_check(client, log,
-                                brine_out_c=results.get(2116))
+                if now - last_freq_time >= 55:
+                    last_freq_time = now
+                    frequency_check(client, log,
+                                    brine_out_c=results.get(2116))
                 volumeflow   = fetch_mqtt_float(VOLUMEFLOW_TOPIC, log)
                 power_gwp    = fetch_mqtt_float(POWER_GWP_TOPIC, log)
                 power_hp     = fetch_mqtt_float(POWER_HP_TOPIC, log)
