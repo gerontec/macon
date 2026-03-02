@@ -89,12 +89,15 @@ ORDER BY s.hour DESC
 """
 
 # ── Heizkurve ────────────────────────────────────────────────────────────────
-def heat_curve(t_out, t_norm=-12.0, t_room=20.0, t_flow_norm=45.0,
-               t_flow_min=20.0, t_flow_max=55.0):
-    if t_out >= t_room:
-        return t_flow_min
-    vl = t_room + (t_flow_norm - t_room) * (t_room - t_out) / (t_room - t_norm)
-    return max(t_flow_min, min(t_flow_max, round(vl, 1)))
+def heat_curve(t_ext, t_int=20.0, offset=0.0, ty_c=70.0, t_int_c=20.0,
+               t_ext_c=-15.0, t_diff_c=10.0, c=1.33, ty_min=25.0, ty_max=70.0):
+    """OSCAT HEAT_TEMP: TY = TR + T_DIFF_C/2·TX + (TY_C - T_DIFF_C/2 - TR)·TX^(1/C)"""
+    tr = t_int + offset
+    tx = (tr - t_ext) / (t_int_c - t_ext_c)
+    if tx <= 0:
+        return ty_min
+    ty = tr + (t_diff_c / 2) * tx + (ty_c - t_diff_c / 2 - tr) * (tx ** (1.0 / c))
+    return max(ty_min, min(ty_max, round(ty, 1)))
 
 # ── Ausgabe ──────────────────────────────────────────────────────────────────
 def bar(cop, width=20):
@@ -144,7 +147,7 @@ def main():
         aussen  = f"{r['aussen_c']:>5.1f}" if r['aussen_c'] is not None else "    –"
         if r['aussen_c'] is not None:
             vl_s    = heat_curve(float(r['aussen_c']))
-            hs      = " ⚡" if vl_s > 39.0 else ""
+            hs      = " 🔥" if vl_s > 39.0 else ""
             vl_soll = f"{vl_s:>5.1f}{hs}"
         else:
             vl_soll = "      –"
