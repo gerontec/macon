@@ -89,7 +89,7 @@ ORDER BY s.hour DESC
 """
 
 # ── Heizkurve ────────────────────────────────────────────────────────────────
-def heat_curve(t_ext, t_int=20.0, offset=0.0, ty_c=70.0, t_int_c=20.0,
+def heat_curve(t_ext, t_int=20.0, offset=0.0, ty_c=55.0, t_int_c=20.0,
                t_ext_c=-15.0, t_diff_c=10.0, c=1.33, ty_min=25.0, ty_max=70.0):
     """OSCAT HEAT_TEMP: TY = TR + T_DIFF_C/2·TX + (TY_C - T_DIFF_C/2 - TR)·TX^(1/C)"""
     tr = t_int + offset

@@ -673,7 +673,7 @@ OELBRENNER_HYS_OFF_K =  1.0   # Ölbrenner AUS  wenn vl_soll < BIVALENZ - 1 K
 def heat_curve(t_ext: float,
                t_int:    float = 20.0,
                offset:   float =  0.0,
-               ty_c:     float = 70.0,
+               ty_c:     float = 55.0,
                t_int_c:  float = 20.0,
                t_ext_c:  float = -15.0,
                t_diff_c: float = 10.0,
@@ -828,7 +828,7 @@ def db_insert(results: dict, cop_2h, outdoor_temp_c, wago_vl_soll_c, log):
 def main():
     log = setup_logging()
     log.info("=" * 60)
-    log.info("macon_daemon v1.13.0 gestartet")
+    log.info("macon_daemon v1.14.0 gestartet")
     log.info(f"  Modbus : {MODBUS_PORT} @ {MODBUS_BAUDRATE} Baud, Slave {SLAVE_ID}")
     log.info(f"  Shelly : http://{SHELLY_IP}")
     log.info(f"  Poll   : alle {POLL_SEC}s  |  DB: alle {DB_SEC}s")
