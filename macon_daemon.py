@@ -112,25 +112,11 @@ STATUS3_BITS = {
     14: "remote_onoff",
 }
 
-# ─── PV-Überschuss-Frequenzsteuerung ─────────────────────────────────────────
-# Topic "sofar": JSON {"ActivePower_PCC_Total": X.XX, ...} [kW], positiv = Einspeisung
-# Kein Überschuss → FREQ_MIN, bei PV_EXCESS_MAX_KW oder mehr → FREQ_MAX
-PV_EXCESS_TOPIC   = "fox2db/state"  # JSON: {"excess": WWWW, ...} [W]
-PV_EXCESS_MAX_W   = 3000            # W PV-Überschuss → FREQ_MAX (= 13,2 kW thermisch)
-FREQ_MIN          = 55              # Hz bei kein PV-Überschuss (Optimum aus Sweep)
-FREQ_MAX          = 72              # Hz bei >= PV_EXCESS_MAX_W (= besserer COP als 80 Hz)
-
-# ─── COP-Optimierungs-Sweep ───────────────────────────────────────────────────
-# SWEEP_MODE = True: Kompressor-Hz langsam erhöhen bis Brine kalt → Optimum finden
-# Danach automatisch auf False setzen (Ergebnis im Log)
-SWEEP_MODE        = False   # Sweep abgeschlossen, Optimum bei 55 Hz gefunden
-SWEEP_START_HZ    = 45
-SWEEP_MAX_HZ      = 80
-SWEEP_STEP_HZ     = 2       # Hz pro Schritt
-SWEEP_INTERVAL_S  = 240     # Sekunden pro Schritt (4 Min zum Einpendeln)
-BRINE_MIN_OUT_C   = 5.0     # Schutzgrenze Sole-Ausgang [°C]
-BRINE_MAX_DELTA_C = 6.0     # Max. Sole-Spreizung IN-OUT [K] — bei Überschreitung: -2 Hz
-DISCHARGE_MAX_C   = 64      # Schutzabschaltung: Heißgas-Temperatur [°C]
+# ─── Frequenzregelung ────────────────────────────────────────────────────────
+FREQ_FIXED        = 55              # Hz Festfrequenz (Optimum aus Sweep)
+BRINE_WARM_HZ     = 67              # Hz wenn Sole warm (brine_out > 4°C)
+BRINE_MIN_OUT_C   = 5.0             # Schutzgrenze Sole-Ausgang [°C]
+DISCHARGE_MAX_C   = 64              # Schutzabschaltung: Heißgas-Temperatur [°C]
 
 # ─── Betriebseinstellungen (dauerhaft sicherstellen) ──────────────────────────
 WORKING_MODE_REG   = 2001   # Betriebsmodus
@@ -521,78 +507,7 @@ def fast_error_check(client, log):
         _dump_error_snapshot(client, new_errors, log)
 
 
-# ─── PV-Überschuss von MQTT lesen (mit Cache) ────────────────────────────────
-# fox2db/state kommt nur 1x/min und ist nicht retained → letzten Wert 90s cachen
-
-_pv_cache: dict = {"value_w": 0.0, "ts": 0.0}
-
-# ─── Sweep-State ──────────────────────────────────────────────────────────────
-_sweep: dict = {
-    "target_hz":   SWEEP_START_HZ,
-    "last_step_ts": 0.0,
-    "best_hz":     SWEEP_START_HZ,
-    "best_cop":    0.0,
-    "done":        False,
-}
 _last_cop: float = 0.0
-PV_CACHE_MAX_AGE = 90  # Sekunden — danach gilt kein Überschuss mehr
-
-
-def fetch_pv_excess_kw(log) -> float:
-    """
-    Liest PV-Überschuss [W] vom MQTT-Topic 'fox2db/state'.
-    Erwartet JSON: {"excess": WWWW, ...}  (Wert in Watt)
-    Topic ist nicht retained und kommt nur 1x/min → Cache (90s).
-    Gibt 0.0 zurück wenn kein frischer Wert verfügbar.
-    """
-    if not HAS_MQTT:
-        return 0.0
-    result = [None]
-
-    def _on_msg(client, userdata, msg):
-        try:
-            data = json.loads(msg.payload.decode())
-            val = float(data.get("excess", 0.0))
-            result[0] = val
-        except Exception:
-            pass
-
-    try:
-        c = mqtt_client.Client()
-        c.on_message = _on_msg
-        c.connect(MQTT_BROKER, MQTT_PORT, keepalive=10)
-        c.subscribe(PV_EXCESS_TOPIC)
-        c.loop_start()
-        deadline = time.time() + 2.0
-        while result[0] is None and time.time() < deadline:
-            time.sleep(0.05)
-        c.loop_stop()
-        c.disconnect()
-    except Exception as e:
-        log.warning(f"MQTT fetch PV-Überschuss '{PV_EXCESS_TOPIC}': {e}")
-
-    if result[0] is not None:
-        _pv_cache["value_w"] = max(0.0, result[0])
-        _pv_cache["ts"] = time.time()
-        log.info(f"PV-Cache aktualisiert: {_pv_cache['value_w']:.0f} W")
-
-    age = time.time() - _pv_cache["ts"]
-    if age < PV_CACHE_MAX_AGE:
-        return _pv_cache["value_w"]
-
-    # Cache abgelaufen → kein Überschuss
-    return 0.0
-
-
-def pv_excess_to_freq(pv_excess_w: float) -> int:
-    """
-    Berechnet Ziel-Kompressorfrequenz [Hz] aus PV-Überschuss [W].
-    Lineare Skalierung: 0 W → FREQ_MIN (45 Hz), >= PV_EXCESS_MAX_W (3000 W) → FREQ_MAX (80 Hz).
-    """
-    if PV_EXCESS_MAX_W <= 0:
-        return FREQ_MIN
-    ratio = min(1.0, pv_excess_w / PV_EXCESS_MAX_W)
-    return round(FREQ_MIN + ratio * (FREQ_MAX - FREQ_MIN))
 
 
 # ─── 5s-Tasks ────────────────────────────────────────────────────────────────
@@ -620,11 +535,10 @@ def settings_check(client, log) -> dict:
     return extra
 
 
-def frequency_check(client, pv_excess_w: float, log, brine_out_c=None, brine_in_c=None):
+def frequency_check(client, log, brine_out_c=None):
     """
     Setzt Kompressorfrequenz.
-    Im SWEEP_MODE: langsam Hz erhöhen, Brine-Delta + Brine-OUT überwachen.
-    Sonst: PV-Überschuss-abhängige Regelung.
+    Regel: brine_out > 4°C → BRINE_WARM_HZ (67 Hz), sonst FREQ_FIXED (55 Hz).
     """
     if read_reg(client, UNIT_REG) == 0:
         log.info("Freq-Check: WP AUS, übersprungen")
@@ -640,72 +554,14 @@ def frequency_check(client, pv_excess_w: float, log, brine_out_c=None, brine_in_
         log.info(f"Freq-Check: Kompressor noch nicht gestartet (real_freq={real_f}), warte")
         return
 
-    if SWEEP_MODE and not _sweep["done"]:
-        now = time.time()
-        target = _sweep["target_hz"]
-
-        brine_delta = round(brine_in_c - brine_out_c, 1) if (brine_in_c is not None and brine_out_c is not None) else None
-        brine_str = (f"Brine {brine_in_c:.1f}→{brine_out_c:.1f}°C  ΔT={brine_delta}K"
-                     if brine_delta is not None else "Brine n/a")
-
-        # Brine-OUT zu kalt → Sweep beenden
-        if brine_out_c is not None and brine_out_c < BRINE_MIN_OUT_C:
-            log.warning(
-                f"Sweep: {brine_str}  Brine OUT < {BRINE_MIN_OUT_C}°C "
-                f"— Grenze bei {target} Hz, halte"
-            )
-            _sweep["done"] = True
-
-        # Brine-Delta zu groß → 2 Hz zurück
-        elif brine_delta is not None and brine_delta > BRINE_MAX_DELTA_C:
-            new_target = max(SWEEP_START_HZ, target - SWEEP_STEP_HZ)
-            _sweep["target_hz"] = new_target
-            _sweep["last_step_ts"] = now
-            log.warning(
-                f"Sweep: {brine_str}  Delta > {BRINE_MAX_DELTA_C}K "
-                f"→ {target} Hz → {new_target} Hz"
-            )
-            target = new_target
-
-        # Zeit für nächsten Schritt
-        elif now - _sweep["last_step_ts"] >= SWEEP_INTERVAL_S:
-            if target < SWEEP_MAX_HZ:
-                target = min(SWEEP_MAX_HZ, target + SWEEP_STEP_HZ)
-                _sweep["target_hz"] = target
-                _sweep["last_step_ts"] = now
-                log.info(
-                    f"Sweep: → {target} Hz  {brine_str}  "
-                    f"COP={_last_cop:.2f}  Bestes: {_sweep['best_hz']} Hz/COP {_sweep['best_cop']:.2f}"
-                )
-            else:
-                _sweep["done"] = True
-                log.info(f"Sweep: Maximum {SWEEP_MAX_HZ} Hz erreicht — fertig")
-
-        # COP-Tracking
-        if _last_cop > _sweep["best_cop"]:
-            _sweep["best_cop"] = _last_cop
-            _sweep["best_hz"]  = target
-
-        set_f = read_reg(client, FREQ_SET_REG)
-        if set_f != target or host_ctrl != 1:
-            write_reg(client, HOST_CTRL_REG, 1, log)
-            time.sleep(0.5)
-            write_reg(client, FREQ_SET_REG, target, log)
-        else:
-            log.info(
-                f"Sweep: {target} Hz (real={real_f})  {brine_str}  COP={_last_cop:.2f}"
-            )
-        return
-
-    # ── Regel bestimmen ──────────────────────────────────────────────────────
     if brine_out_c is not None and brine_out_c > 4.0:
-        target_freq = 67
+        target_freq = BRINE_WARM_HZ
         rule   = "BRINE_WARM"
         detail = f"brine_out={brine_out_c:.1f}°C > 4°C"
     else:
-        target_freq = pv_excess_to_freq(pv_excess_w)
-        rule   = "PV_REGELUNG"
-        detail = f"brine_out={brine_out_c}°C ≤ 4°C  PV={pv_excess_w:.0f} W"
+        target_freq = FREQ_FIXED
+        rule   = "FEST"
+        detail = f"brine_out={brine_out_c}°C ≤ 4°C"
 
     set_f = read_reg(client, FREQ_SET_REG)
     if set_f == target_freq and host_ctrl == 1:
@@ -778,7 +634,7 @@ def fetch_mqtt_float(topic: str, log) -> float | None:
     return result[0]
 
 
-def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, power_zenner, pv_excess_w: float, cop_avg_2h, log):
+def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, power_zenner, cop_avg_2h, log):
     """Veröffentlicht Status-JSON auf MQTT topic 'heatmacon'."""
     if not HAS_MQTT:
         log.debug("paho-mqtt nicht verfügbar, MQTT-Publish übersprungen")
@@ -803,9 +659,6 @@ def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, p
     payload["power_zenner_w"] = power_zenner
     payload["power_hp_w"]     = power_hp
     payload["power_gwp_w"]    = power_gwp
-    # PV-Überschuss und Zielfrequenz
-    payload["pv_excess_w"]    = round(pv_excess_w, 0)
-    payload["freq_target_hz"] = pv_excess_to_freq(pv_excess_w)
     tank_temp_c = fetch_mqtt_float(TANK_TEMP_TOPIC, log)
     payload["tank_temp_tuya_c"] = tank_temp_c
     payload["cop_avg_2h"]       = cop_avg_2h   # kumulativer COP-Ø der letzten 2h (cop_report.py-Logik)
@@ -847,7 +700,7 @@ def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, p
         except Exception as e:
             log.warning(f"COP-Berechnung Fehler: {e}")
         tank_str = f"  Tank={tank_temp_c:.0f}°C" if tank_temp_c is not None else ""
-        log.info(f"MQTT: {MQTT_TOPIC} ← {len(payload)} Felder  PV={pv_excess_w:.0f} W → {pv_excess_to_freq(pv_excess_w)} Hz{tank_str}")
+        log.info(f"MQTT: {MQTT_TOPIC} ← {len(payload)} Felder  {tank_str}")
     except Exception as e:
         log.error(f"MQTT-Publish-Fehler: {e}")
 
@@ -890,12 +743,12 @@ def db_insert(results: dict, cop_2h, log):
 def main():
     log = setup_logging()
     log.info("=" * 60)
-    log.info("macon_daemon v1.5.6 gestartet")
+    log.info("macon_daemon v1.8.0 gestartet")
     log.info(f"  Modbus : {MODBUS_PORT} @ {MODBUS_BAUDRATE} Baud, Slave {SLAVE_ID}")
     log.info(f"  Shelly : http://{SHELLY_IP}")
     log.info(f"  Poll   : alle {POLL_SEC}s  |  DB: alle {DB_SEC}s")
     log.info(f"  DB     : {'aktiv' if HAS_DB else 'DEAKTIVIERT (pymysql fehlt)'}")
-    log.info(f"  PV     : topic='{PV_EXCESS_TOPIC}'  {FREQ_MIN} Hz (0 W) → {FREQ_MAX} Hz (>={PV_EXCESS_MAX_W} W)")
+    log.info(f"  Freq   : FEST={FREQ_FIXED} Hz  BRINE_WARM={BRINE_WARM_HZ} Hz (brine_out > 4°C)")
     log.info(f"  WAGO   : {WAGO_HOST}  HK-Pumpe: Reg {HK_PUMP_REG} Bit {HK_PUMP_BIT}")
     log.info("=" * 60)
 
@@ -1005,11 +858,8 @@ def main():
                 if discharge_protect(client, results, log):
                     time.sleep(POLL_SEC)
                     continue
-                # PV-Überschuss holen und Frequenz setzen
-                pv_excess_w = fetch_pv_excess_kw(log)
-                frequency_check(client, pv_excess_w, log,
-                                brine_out_c=results.get(2116),
-                                brine_in_c=results.get(2115))
+                frequency_check(client, log,
+                                brine_out_c=results.get(2116))
                 volumeflow   = fetch_mqtt_float(VOLUMEFLOW_TOPIC, log)
                 power_gwp    = fetch_mqtt_float(POWER_GWP_TOPIC, log)
                 power_hp     = fetch_mqtt_float(POWER_HP_TOPIC, log)
@@ -1019,7 +869,7 @@ def main():
                     last_db_insert = now
                     _cached_cop_2h = fetch_avg_cop_2h(log)
                     db_insert(results, _cached_cop_2h, log)
-                mqtt_publish(results, shelly_state, volumeflow, power_gwp, power_hp, power_zenner, pv_excess_w, _cached_cop_2h, log)
+                mqtt_publish(results, shelly_state, volumeflow, power_gwp, power_hp, power_zenner, _cached_cop_2h, log)
 
         except ModbusException as e:
             log.error(f"Modbus-Ausnahme: {e}")
