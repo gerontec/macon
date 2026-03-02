@@ -66,15 +66,24 @@ SELECT
     ROUND(AVG(m.Returntemperature), 1)                               AS ruecklauf_c,
     ROUND(AVG(m.TemperatureDifference), 1)                           AS delta_t,
     ROUND(AVG(m.Volumeflow), 3)                                      AS volumeflow_m3h,
-    COUNT(s.id)                                                      AS messpunkte
+    COUNT(s.id)                                                      AS messpunkte,
+    p.outdoor_temp_c                                                 AS aussen_c
 FROM sdm72d s
 JOIN mbus2 m ON m.dth = s.hour
+LEFT JOIN (
+    SELECT DATE_FORMAT(timestamp, '%%Y-%%m-%%d-%%H') AS hour,
+           ROUND(AVG(outdoor_temp_c), 1)          AS outdoor_temp_c
+    FROM macon_pivot
+    WHERE timestamp BETWEEN %s AND %s
+      AND outdoor_temp_c IS NOT NULL
+    GROUP BY 1
+) p ON p.hour = s.hour
 WHERE s.timestamp BETWEEN %s AND %s
   AND s.active_power_l3 > 50        -- Nur wenn HP wirklich läuft
   AND m.Power100W > 0
-GROUP BY s.hour
-HAVING cop IS NOT NULL AND cop <= 4
-ORDER BY s.hour
+GROUP BY s.hour, p.outdoor_temp_c
+HAVING cop IS NOT NULL AND cop <= 6
+ORDER BY s.hour DESC
 """
 
 # ── Ausgabe ──────────────────────────────────────────────────────────────────
@@ -92,7 +101,7 @@ def main():
 
     with conn:
         with conn.cursor() as cur:
-            cur.execute(QUERY, (start_str, end_str))
+            cur.execute(QUERY, (start_str, end_str, start_str, end_str))
             rows = cur.fetchall()
 
     if not rows:
@@ -102,10 +111,10 @@ def main():
     # Header
     print()
     print(f"  COP-Stundenbericht  |  {start_str[:10]}  bis  {end_str[:10]}")
-    print("─" * 95)
+    print("─" * 104)
     print(f"  {'Stunde':<16}  {'El[kWh]':>7}  {'Th[kWh]':>7}  {'COP':>5}  "
-          f"{'VL°C':>5}  {'RL°C':>5}  {'ΔT':>4}  {'l/h':>6}  COP-Balken")
-    print("─" * 95)
+          f"{'VL°C':>5}  {'RL°C':>5}  {'ΔT':>4}  {'l/h':>6}  {'Aus°C':>5}  COP-Balken")
+    print("─" * 104)
 
     cop_sum = 0.0
     cop_count = 0
@@ -118,6 +127,7 @@ def main():
         # Volumeflow: m³/h → l/h
         vf_lh = round(r["volumeflow_m3h"] * 1000) if r["volumeflow_m3h"] else 0
 
+        aussen = f"{r['aussen_c']:>5.1f}" if r['aussen_c'] is not None else "    –"
         print(
             f"  {r['stunde']:<16}  "
             f"{r['el_kwh']:>7.3f}  "
@@ -127,13 +137,14 @@ def main():
             f"{r['ruecklauf_c']:>5.1f}  "
             f"{r['delta_t']:>4.1f}  "
             f"{vf_lh:>6}  "
+            f"{aussen}  "
             f"{bar(cop_val)}"
         )
 
-    print("─" * 95)
+    print("─" * 104)
     if cop_count:
         print(f"  {'Ø COP':<16}  {'':>7}  {'':>7}  {cop_sum/cop_count:>5.2f}  "
-              f"{'':>5}  {'':>5}  {'':>4}  {'':>6}  {bar(cop_sum/cop_count)}")
+              f"{'':>5}  {'':>5}  {'':>4}  {'':>6}  {'':>5}  {bar(cop_sum/cop_count)}")
     print()
 
 if __name__ == "__main__":
