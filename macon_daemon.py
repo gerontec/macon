@@ -173,6 +173,7 @@ SHELLY_IP       = "192.168.178.100"
 WAGO_HOST       = "192.168.178.2"
 WAGO_MODBUS_PORT = 502
 WAGO_TEMP_REG   = 12347   # temp_aussen × 100 (INT, Modbus TCP)
+WAGO_VL_SOLL_REG = 12384  # Soll-Vorlauftemperatur × 100 (OSCAT, Modbus TCP)
 PUMP_CTRL       = "/home/pi/python/pump_control.py"
 
 # ─── MQTT Status-Publish ──────────────────────────────────────────────────────
@@ -638,25 +639,29 @@ def fetch_mqtt_float(topic: str, log) -> float | None:
     return result[0]
 
 
-def fetch_wago_outdoor_temp(log) -> float | None:
-    """Liest Außentemperatur von WAGO Modbus TCP Reg 12347 (temp_aussen × 100, INT)."""
+def fetch_wago_data(log) -> dict:
+    """Liest WAGO Modbus TCP: Außentemperatur (Reg 12347) + OSCAT VL-Soll (Reg 12384).
+    Gibt dict mit 'outdoor_temp_c' und 'wago_vl_soll_c' zurück (None bei Fehler)."""
+    result = {"outdoor_temp_c": None, "wago_vl_soll_c": None}
     try:
         c = ModbusTcpClient(WAGO_HOST, port=WAGO_MODBUS_PORT, timeout=2)
         if not c.connect():
             log.warning("WAGO Modbus TCP: Verbindung fehlgeschlagen")
-            return None
-        rr = c.read_holding_registers(WAGO_TEMP_REG, count=1, slave=1)
+            return result
+        for reg, key in ((WAGO_TEMP_REG, "outdoor_temp_c"),
+                         (WAGO_VL_SOLL_REG, "wago_vl_soll_c")):
+            rr = c.read_holding_registers(reg, count=1, slave=1)
+            if rr.isError():
+                log.warning(f"WAGO Reg {reg}: Lesefehler {rr}")
+                continue
+            raw = rr.registers[0]
+            if raw >= 32768:
+                raw -= 65536      # signed INT16
+            result[key] = round(raw / 100.0, 1)
         c.close()
-        if rr.isError():
-            log.warning(f"WAGO Reg {WAGO_TEMP_REG}: Lesefehler {rr}")
-            return None
-        raw = rr.registers[0]
-        if raw >= 32768:
-            raw -= 65536          # signed INT16
-        return round(raw / 100.0, 1)
     except Exception as e:
-        log.warning(f"WAGO Außentemp Fehler: {e}")
-        return None
+        log.warning(f"WAGO Lesefehler: {e}")
+    return result
 
 
 # ─── Heizkurve + Heizstab-Pseudo-Relais ──────────────────────────────────────
@@ -693,7 +698,7 @@ def heizstab_check(outdoor_temp_c: float | None, state: bool | None, log) -> boo
     return state
 
 
-def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, power_zenner, cop_avg_2h, outdoor_temp_c, log):
+def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, power_zenner, cop_avg_2h, outdoor_temp_c, wago_vl_soll_c, log):
     """Veröffentlicht Status-JSON auf MQTT topic 'heatmacon'."""
     if not HAS_MQTT:
         log.debug("paho-mqtt nicht verfügbar, MQTT-Publish übersprungen")
@@ -722,6 +727,7 @@ def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, p
     payload["tank_temp_tuya_c"] = tank_temp_c
     payload["cop_avg_2h"]       = cop_avg_2h   # kumulativer COP-Ø der letzten 2h (cop_report.py-Logik)
     payload["outdoor_temp_c"]   = outdoor_temp_c
+    payload["wago_vl_soll_c"]  = wago_vl_soll_c
     for reg, info in ERROR_REGS.items():
         if reg in results:
             payload[info["name"].lower().replace(" ", "_")] = results[reg]
@@ -765,7 +771,7 @@ def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, p
         log.error(f"MQTT-Publish-Fehler: {e}")
 
 
-def db_insert(results: dict, cop_2h, outdoor_temp_c, log):
+def db_insert(results: dict, cop_2h, outdoor_temp_c, wago_vl_soll_c, log):
     """Schreibt alle bekannten Register-Werte + COP als neue Zeile in macon_pivot."""
     if not HAS_DB:
         log.debug("DB nicht verfügbar (pymysql fehlt)")
@@ -790,6 +796,10 @@ def db_insert(results: dict, cop_2h, outdoor_temp_c, log):
                 cols.append("outdoor_temp_c")
                 vals.append(outdoor_temp_c)
                 ph.append("%s")
+            if wago_vl_soll_c is not None:
+                cols.append("wago_vl_soll_c")
+                vals.append(wago_vl_soll_c)
+                ph.append("%s")
             cur.execute(
                 f"INSERT INTO {PIVOT_TABLE} ({','.join(cols)}) "
                 f"VALUES ({','.join(ph)})",
@@ -807,7 +817,7 @@ def db_insert(results: dict, cop_2h, outdoor_temp_c, log):
 def main():
     log = setup_logging()
     log.info("=" * 60)
-    log.info("macon_daemon v1.11.0 gestartet")
+    log.info("macon_daemon v1.12.0 gestartet")
     log.info(f"  Modbus : {MODBUS_PORT} @ {MODBUS_BAUDRATE} Baud, Slave {SLAVE_ID}")
     log.info(f"  Shelly : http://{SHELLY_IP}")
     log.info(f"  Poll   : alle {POLL_SEC}s  |  DB: alle {DB_SEC}s")
@@ -932,14 +942,16 @@ def main():
                 power_gwp     = fetch_mqtt_float(POWER_GWP_TOPIC, log)
                 power_hp      = fetch_mqtt_float(POWER_HP_TOPIC, log)
                 power_zenner  = fetch_mqtt_float(POWER_ZENNER_TOPIC, log)
-                outdoor_temp_c = fetch_wago_outdoor_temp(log)
+                wago           = fetch_wago_data(log)
+                outdoor_temp_c = wago["outdoor_temp_c"]
+                wago_vl_soll_c = wago["wago_vl_soll_c"]
                 heizstab_state = heizstab_check(outdoor_temp_c, heizstab_state, log)
                 # 60s DB-Insert mit aktuellem COP
                 if now - last_db_insert >= 60:
                     last_db_insert = now
                     _cached_cop_2h = fetch_avg_cop_2h(log)
-                    db_insert(results, _cached_cop_2h, outdoor_temp_c, log)
-                mqtt_publish(results, shelly_state, volumeflow, power_gwp, power_hp, power_zenner, _cached_cop_2h, outdoor_temp_c, log)
+                    db_insert(results, _cached_cop_2h, outdoor_temp_c, wago_vl_soll_c, log)
+                mqtt_publish(results, shelly_state, volumeflow, power_gwp, power_hp, power_zenner, _cached_cop_2h, outdoor_temp_c, wago_vl_soll_c, log)
 
         except ModbusException as e:
             log.error(f"Modbus-Ausnahme: {e}")
