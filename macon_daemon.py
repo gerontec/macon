@@ -203,6 +203,10 @@ REGISTER_MAP = {
     2121: ("ac_current",        "A"),
     2133: ("system_status_1",   "bits"),
     2135: ("system_status_2",   "bits"),
+    2136: ("system_status_3",   "bits"),
+    2134: ("error_code_1",      "bits"),
+    2137: ("error_code_2",      "bits"),
+    2138: ("error_code_3",      "bits"),
     # Wassertemperaturen
     2100: ("water_tank_temp",   "C"),
     2102: ("outlet_water_temp", "C"),
@@ -239,7 +243,7 @@ READ_BLOCKS = [
     (2032,  8),   # 2032–2039: evap_coil_temp, low_side_temp
     (2056,  2),   # 2056–2057: host_freq_ctrl, set_frequency
     (2100, 29),   # 2100–2128: Temperaturen, EEV, Frequenz, Strom
-    (2133,  3),   # 2133–2135: system_status_1/2
+    (2133,  6),   # 2133–2138: system_status_1/2/3, error_code_1/2/3
     (2140,  1),   # 2140:      refrig_lo_temp
 ]
 
