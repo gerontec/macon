@@ -659,6 +659,40 @@ def fetch_wago_outdoor_temp(log) -> float | None:
         return None
 
 
+# ─── Heizkurve + Heizstab-Pseudo-Relais ──────────────────────────────────────
+BIVALENZ_SETPOINT_C = 39.0   # WP-Maximaltemperatur; darüber braucht es den Heizstab
+HEIZSTAB_HYS_ON_K  =  1.0   # Heizstab EIN  wenn vl_soll > BIVALENZ + 1 K
+HEIZSTAB_HYS_OFF_K =  1.0   # Heizstab AUS  wenn vl_soll < BIVALENZ - 1 K
+
+def heat_curve(t_out: float,
+               t_norm: float = -12.0,
+               t_room: float =  20.0,
+               t_flow_norm: float = 45.0,
+               t_flow_min: float  = 20.0,
+               t_flow_max: float  = 55.0) -> float:
+    """Heizkurve nach OSCAT HEAT_TEMP: Vorlauf-Solltemperatur aus Außentemperatur."""
+    if t_out >= t_room:
+        return t_flow_min
+    vl = t_room + (t_flow_norm - t_room) * (t_room - t_out) / (t_room - t_norm)
+    return max(t_flow_min, min(t_flow_max, round(vl, 1)))
+
+
+def heizstab_check(outdoor_temp_c: float | None, state: bool | None, log) -> bool | None:
+    """Pseudo-Relais Heizstab: schaltet EIN/AUS basierend auf Heizkurve. Nur bei Zustandswechsel."""
+    if outdoor_temp_c is None:
+        return state
+    vl_soll = heat_curve(outdoor_temp_c)
+    if state is not True and vl_soll > BIVALENZ_SETPOINT_C + HEIZSTAB_HYS_ON_K:
+        log.info(f"Heizstab ON   [vl_soll={vl_soll}°C > {BIVALENZ_SETPOINT_C + HEIZSTAB_HYS_ON_K}°C"
+                 f"  t_out={outdoor_temp_c}°C]")
+        return True
+    if state is not False and vl_soll < BIVALENZ_SETPOINT_C - HEIZSTAB_HYS_OFF_K:
+        log.info(f"Heizstab OFF  [vl_soll={vl_soll}°C < {BIVALENZ_SETPOINT_C - HEIZSTAB_HYS_OFF_K}°C"
+                 f"  t_out={outdoor_temp_c}°C]")
+        return False
+    return state
+
+
 def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, power_zenner, cop_avg_2h, outdoor_temp_c, log):
     """Veröffentlicht Status-JSON auf MQTT topic 'heatmacon'."""
     if not HAS_MQTT:
@@ -773,7 +807,7 @@ def db_insert(results: dict, cop_2h, outdoor_temp_c, log):
 def main():
     log = setup_logging()
     log.info("=" * 60)
-    log.info("macon_daemon v1.10.0 gestartet")
+    log.info("macon_daemon v1.11.0 gestartet")
     log.info(f"  Modbus : {MODBUS_PORT} @ {MODBUS_BAUDRATE} Baud, Slave {SLAVE_ID}")
     log.info(f"  Shelly : http://{SHELLY_IP}")
     log.info(f"  Poll   : alle {POLL_SEC}s  |  DB: alle {DB_SEC}s")
@@ -795,6 +829,7 @@ def main():
 
     shelly_state      = None
     hk_pump_state     = None   # None = unbekannt, True/False = letzter Zustand
+    heizstab_state    = None   # None = unbekannt, True = EIN, False = AUS (Pseudo-Relais)
     last_db_time      = 0.0
     last_db_insert    = 0.0
     last_freq_time    = 0.0
@@ -898,6 +933,7 @@ def main():
                 power_hp      = fetch_mqtt_float(POWER_HP_TOPIC, log)
                 power_zenner  = fetch_mqtt_float(POWER_ZENNER_TOPIC, log)
                 outdoor_temp_c = fetch_wago_outdoor_temp(log)
+                heizstab_state = heizstab_check(outdoor_temp_c, heizstab_state, log)
                 # 60s DB-Insert mit aktuellem COP
                 if now - last_db_insert >= 60:
                     last_db_insert = now
