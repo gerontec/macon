@@ -76,6 +76,25 @@ CURRENT_REG     = 2121   # AC-Strom [A]
 
 COMPRESSOR_BIT  = 1
 
+# ─── Systemstatus-3 Bit-Dekodierung (Reg 2136) ───────────────────────────────
+STATUS3_BITS = {
+    0:  "solenoid_valve",
+    1:  "unloading_valve",
+    2:  "oil_return_valve",
+    3:  "grundwasserpumpe",
+    4:  "brine_frost_protect",
+    5:  "defrost_active",
+    6:  "refrigerant_recovery",
+    7:  "oil_return_active",
+    8:  "wired_controller",
+    9:  "economy_mode",
+    10: "frost_protect_primary",
+    11: "frost_protect_secondary",
+    12: "sterilization",
+    13: "secondary_pump",
+    14: "remote_onoff",
+}
+
 # ─── PV-Überschuss-Frequenzsteuerung ─────────────────────────────────────────
 # Topic "sofar": JSON {"ActivePower_PCC_Total": X.XX, ...} [kW], positiv = Einspeisung
 # Kein Überschuss → FREQ_MIN, bei PV_EXCESS_MAX_KW oder mehr → FREQ_MAX
@@ -752,9 +771,9 @@ def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, p
         if reg in results:
             payload[name] = results[reg]
     payload["shelly_on"] = shelly_state if shelly_state is not None else False
-    payload["grundwasserpumpe"] = bool(
-        (results.get(BRINE_PUMP_REG, 0) >> BRINE_PUMP_BIT) & 1
-    )
+    s3 = results.get(BRINE_PUMP_REG, 0)
+    for bit, name in STATUS3_BITS.items():
+        payload[name] = bool((s3 >> bit) & 1)
     mode_map = {0: "cooling", 1: "underfloor_heating", 2: "fan_coil_heating",
                 5: "DHW", 6: "auto"}
     mode_val = results.get(WORKING_MODE_REG)
