@@ -67,12 +67,14 @@ SELECT
     ROUND(AVG(m.TemperatureDifference), 1)                           AS delta_t,
     ROUND(AVG(m.Volumeflow), 3)                                      AS volumeflow_m3h,
     COUNT(s.id)                                                      AS messpunkte,
-    p.outdoor_temp_c                                                 AS aussen_c
+    p.outdoor_temp_c                                                 AS aussen_c,
+    p.wago_vl_soll_c                                                 AS wago_vl_soll_c
 FROM sdm72d s
 JOIN mbus2 m ON m.dth = s.hour
 LEFT JOIN (
     SELECT DATE_FORMAT(timestamp, '%%Y-%%m-%%d-%%H') AS hour,
-           ROUND(AVG(outdoor_temp_c), 1)          AS outdoor_temp_c
+           ROUND(AVG(outdoor_temp_c), 1)          AS outdoor_temp_c,
+           ROUND(AVG(wago_vl_soll_c), 1)          AS wago_vl_soll_c
     FROM macon_pivot
     WHERE timestamp BETWEEN %s AND %s
       AND outdoor_temp_c IS NOT NULL
@@ -81,7 +83,7 @@ LEFT JOIN (
 WHERE s.timestamp BETWEEN %s AND %s
   AND s.active_power_l3 > 50        -- Nur wenn HP wirklich läuft
   AND m.Power100W > 0
-GROUP BY s.hour, p.outdoor_temp_c
+GROUP BY s.hour, p.outdoor_temp_c, p.wago_vl_soll_c
 HAVING cop IS NOT NULL AND cop <= 6
 ORDER BY s.hour DESC
 """
@@ -119,10 +121,10 @@ def main():
     # Header
     print()
     print(f"  COP-Stundenbericht  |  {start_str[:10]}  bis  {end_str[:10]}")
-    print("─" * 113)
+    print("─" * 122)
     print(f"  {'Stunde':<16}  {'El[kWh]':>7}  {'Th[kWh]':>7}  {'COP':>5}  "
-          f"{'VL°C':>5}  {'RL°C':>5}  {'ΔT':>4}  {'l/h':>6}  {'Aus°C':>5}  {'VL-Soll':>7}  COP-Balken")
-    print("─" * 113)
+          f"{'VL°C':>5}  {'RL°C':>5}  {'ΔT':>4}  {'l/h':>6}  {'Aus°C':>5}  {'VL-Soll':>7}  {'WAGO-VL':>7}  COP-Balken")
+    print("─" * 122)
 
     cop_sum = 0.0
     cop_count = 0
@@ -141,11 +143,12 @@ def main():
 
         aussen  = f"{r['aussen_c']:>5.1f}" if r['aussen_c'] is not None else "    –"
         if r['aussen_c'] is not None:
-            vl_s = heat_curve(float(r['aussen_c']))
-            hs   = " ⚡" if vl_s > 39.0 else ""
+            vl_s    = heat_curve(float(r['aussen_c']))
+            hs      = " ⚡" if vl_s > 39.0 else ""
             vl_soll = f"{vl_s:>5.1f}{hs}"
         else:
             vl_soll = "      –"
+        wago_vl = f"{r['wago_vl_soll_c']:>7.1f}" if r['wago_vl_soll_c'] is not None else "      –"
         print(
             f"  {r['stunde']:<16}  "
             f"{r['el_kwh']:>7.3f}  "
@@ -157,17 +160,18 @@ def main():
             f"{vf_lh:>6}  "
             f"{aussen}  "
             f"{vl_soll}  "
+            f"{wago_vl}  "
             f"{bar(cop_val)}"
         )
 
-    print("─" * 113)
+    print("─" * 122)
     if cop_count:
         cop_avg   = cop_sum / cop_count
         cop_total = th_sum / el_sum if el_sum else 0.0
         print(f"  {'Ø COP':<16}  {'':>7}  {'':>7}  {cop_avg:>5.2f}  "
-              f"{'':>5}  {'':>5}  {'':>4}  {'':>6}  {'':>5}  {'':>7}  {bar(cop_avg)}")
+              f"{'':>5}  {'':>5}  {'':>4}  {'':>6}  {'':>5}  {'':>7}  {'':>7}  {bar(cop_avg)}")
         print(f"  {'Σ':<16}  {el_sum:>7.3f}  {th_sum:>7.3f}  {cop_total:>5.2f}  "
-              f"{'':>5}  {'':>5}  {'':>4}  {'':>6}  {'':>5}  {'':>7}  {bar(cop_total)}")
+              f"{'':>5}  {'':>5}  {'':>4}  {'':>6}  {'':>5}  {'':>7}  {'':>7}  {bar(cop_total)}")
     print()
 
 if __name__ == "__main__":
