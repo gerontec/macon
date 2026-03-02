@@ -76,6 +76,23 @@ CURRENT_REG     = 2121   # AC-Strom [A]
 
 COMPRESSOR_BIT  = 1
 
+# ─── Systemstatus-2 Bit-Dekodierung (Reg 2135) ───────────────────────────────
+STATUS2_BITS = {
+    0:  "unit_on",
+    1:  "compressor_on",
+    2:  "fan_high_speed",
+    5:  "water_pump_on",
+    6:  "fourway_valve",
+    7:  "electric_heater",
+    8:  "water_flow_switch",
+    9:  "high_pressure_switch",
+    10: "low_pressure_switch",
+    11: "remote_onoff_active",
+    12: "mode_change_active",
+    13: "threeway_valve_1",
+    14: "threeway_valve_2",
+}
+
 # ─── Systemstatus-3 Bit-Dekodierung (Reg 2136) ───────────────────────────────
 STATUS3_BITS = {
     0:  "solenoid_valve",
@@ -771,6 +788,9 @@ def mqtt_publish(results: dict, shelly_state, volumeflow, power_gwp, power_hp, p
         if reg in results:
             payload[name] = results[reg]
     payload["shelly_on"] = shelly_state if shelly_state is not None else False
+    s2 = results.get(COMPRESSOR_REG, 0)
+    for bit, name in STATUS2_BITS.items():
+        payload[name] = bool((s2 >> bit) & 1)
     s3 = results.get(BRINE_PUMP_REG, 0)
     for bit, name in STATUS3_BITS.items():
         payload[name] = bool((s3 >> bit) & 1)
